@@ -12,9 +12,30 @@ app.use(express.json({ limit: "25mb" }));
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const STAFF_API_KEY = process.env.STAFF_API_KEY || "staff123";
+
+// memoria temporal de reportes
+let reports = [];
 
 app.get("/", (req, res) => {
   res.send("Rave Safety backend is running.");
+});
+
+// endpoint para staff
+app.get("/reports", (req, res) => {
+  const apiKey = req.headers["x-staff-key"];
+
+  if (apiKey !== STAFF_API_KEY) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized"
+    });
+  }
+
+  res.json({
+    success: true,
+    reports
+  });
 });
 
 app.post("/report", async (req, res) => {
@@ -32,6 +53,30 @@ app.post("/report", async (req, res) => {
       isEmergency,
       photoBase64
     } = req.body;
+
+    const reportId = Date.now().toString();
+
+    const newReport = {
+      id: reportId,
+      incidentType,
+      description,
+      location,
+      isAnonymous,
+      timestamp,
+      latitude,
+      longitude,
+      isEmergency,
+      hasPhoto: !!photoBase64,
+      status: "open"
+    };
+
+    // guardar al principio para que el más reciente salga primero
+    reports.unshift(newReport);
+
+    // limitar memoria a últimos 200
+    if (reports.length > 200) {
+      reports = reports.slice(0, 200);
+    }
 
     const gpsLink =
       latitude != null && longitude != null
@@ -95,7 +140,9 @@ ${gpsLink}`;
       );
     }
 
-    res.json({ success: true });
+    res.json({
+      success: true
+    });
   } catch (error) {
     console.error("=== TELEGRAM ERROR ===");
 
