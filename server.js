@@ -1,454 +1,239 @@
-const express = require("express");
-const cors = require("cors");
-const axios = require("axios");
-const fs = require("fs");
-const path = require("path");
-const FormData = require("form-data");
-const admin = require("firebase-admin");
+const express = require("express")
+const cors = require("cors")
+const axios = require("axios")
+const admin = require("firebase-admin")
 
-const app = express();
+const app = express()
+app.use(cors())
+app.use(express.json())
 
-app.use(cors());
-app.use(express.json({ limit: "25mb" }));
-
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const STAFF_API_KEY = process.env.STAFF_API_KEY || "staff123";
-
-const firebaseServiceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID
 
 admin.initializeApp({
-  credential: admin.credential.cert(firebaseServiceAccount)
-});
+  credential: admin.credential.applicationDefault()
+})
 
-const db = admin.firestore();
+const db = admin.firestore()
 
-let reports = [];
-let staffDevices = [];
+/* ------------------------------------------------ */
+/* REPORT ID GENERATOR */
+/* ------------------------------------------------ */
 
-let reportCounters = {
-  MED: 1,
-  HAR: 1,
-  SEC: 1,
-  THE: 1,
-  SUS: 1,
-  GEN: 1
-};
+async function generateReportID() {
+  const counterRef = db.collection("system").doc("reportCounter")
 
-function getIncidentPrefix(type) {
-  switch (type) {
-    case "Medical Emergency":
-      return "MED";
-    case "Harassment":
-      return "HAR";
-    case "Violence":
-      return "SEC";
-    case "Theft":
-      return "THE";
-    case "Suspicious Activity":
-      return "SUS";
-    default:
-      return "GEN";
-  }
+  const newValue = await db.runTransaction(async (tx) => {
+    const doc = await tx.get(counterRef)
+
+    let value = 0
+
+    if (doc.exists) {
+      value = doc.data().value || 0
+    }
+
+    value += 1
+
+    tx.set(counterRef, { value })
+
+    return value
+  })
+
+  return `R${newValue}`
 }
+
+/* ------------------------------------------------ */
+/* VERIFY ADMIN ACCESS */
+/* ------------------------------------------------ */
 
 async function verifyAdminAccess(req) {
-  const uid = req.headers["x-staff-uid"];
+  try {
+    const uid = req.headers["x-staff-uid"]
 
-  if (!uid) {
-    return { ok: false, status: 401, error: "Missing staff uid" };
+    if (!uid) {
+      return { ok: false, status: 401, error: "Missing staff uid" }
+    }
+
+    const doc = await db.collection("staffUsers").doc(uid).get()
+
+    if (!doc.exists) {
+      return { ok: false, status: 403, error: "Staff profile not found" }
+    }
+
+    const data = doc.data() || {}
+
+    if (!data.active) {
+      return { ok: false, status: 403, error: "Staff account inactive" }
+    }
+
+    if (!data.canManageStaff) {
+      return { ok: false, status: 403, error: "No permission to manage staff" }
+    }
+
+    return { ok: true, uid, profile: data }
+
+  } catch (error) {
+    console.error("verifyAdminAccess error:", error)
+    return { ok: false, status: 500, error: "Admin verification failed" }
   }
-
-  const staffDoc = await db.collection("staffUsers").document(uid).get();
-
-  if (!staffDoc.exists) {
-    return { ok: false, status: 403, error: "Staff profile not found" };
-  }
-
-  const data = staffDoc.data();
-
-  if (!data.active) {
-    return { ok: false, status: 403, error: "Staff account inactive" };
-  }
-
-  if (!data.canManageStaff) {
-    return { ok: false, status: 403, error: "No permission to manage staff" };
-  }
-
-  return { ok: true, uid, profile: data };
 }
 
-app.get("/", (req, res) => {
-  res.send("Rave Safety backend running");
-});
-
-app.post("/staff/register-device", (req, res) => {
-  const apiKey = req.headers["x-staff-key"];
-
-  if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized"
-    });
-  }
-
-  const { fcmToken, platform } = req.body;
-
-  if (!fcmToken) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing token"
-    });
-  }
-
-  const exists = staffDevices.find(d => d.fcmToken === fcmToken);
-
-  if (!exists) {
-    staffDevices.push({
-      fcmToken,
-      platform: platform || "ios",
-      registeredAt: new Date().toISOString()
-    });
-  }
-
-  res.json({
-    success: true,
-    devicesCount: staffDevices.length
-  });
-});
-
-app.get("/reports", (req, res) => {
-  const apiKey = req.headers["x-staff-key"];
-
-  if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized"
-    });
-  }
-
-  res.json({
-    success: true,
-    reports
-  });
-});
-
-app.get("/report-status/:id", (req, res) => {
-  const { id } = req.params;
-
-  const report = reports.find(r => r.id === id);
-
-  if (!report) {
-    return res.status(404).json({
-      success: false,
-      error: "Report not found"
-    });
-  }
-
-  res.json({
-    success: true,
-    report: {
-      id: report.id,
-      incidentType: report.incidentType,
-      status: report.status,
-      location: report.location,
-      timestamp: report.timestamp,
-      isEmergency: report.isEmergency
-    }
-  });
-});
-
-app.patch("/reports/:id/status", async (req, res) => {
-  const apiKey = req.headers["x-staff-key"];
-
-  if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized"
-    });
-  }
-
-  const { id } = req.params;
-  const { status } = req.body;
-
-  const allowedStatuses = ["open", "in_progress", "resolved"];
-
-  if (!allowedStatuses.includes(status)) {
-    return res.status(400).json({
-      success: false,
-      error: "Invalid status"
-    });
-  }
-
-  const reportIndex = reports.findIndex(r => r.id === id);
-
-  if (reportIndex === -1) {
-    return res.status(404).json({
-      success: false,
-      error: "Report not found"
-    });
-  }
-
-  reports[reportIndex].status = status;
-
-  try {
-    await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        chat_id: TELEGRAM_CHAT_ID,
-        text:
-`🛠️ Incident Status Updated
-
-Incident: ${reports[reportIndex].incidentType}
-New Status: ${status}
-Report ID: ${id}`
-      }
-    );
-  } catch (error) {
-    console.error("Failed to notify Telegram about status update");
-  }
-
-  res.json({
-    success: true,
-    report: reports[reportIndex]
-  });
-});
+/* ------------------------------------------------ */
+/* SEND REPORT */
+/* ------------------------------------------------ */
 
 app.post("/report", async (req, res) => {
-  let tempFilePath = null;
 
   try {
-    const {
-      incidentType,
-      description,
-      location,
-      isAnonymous,
-      timestamp,
-      latitude,
-      longitude,
-      isEmergency,
-      photoBase64,
-      isMedicalHelp,
-      consciousStatus,
-      breathingStatus,
-      approximateAge,
-      reporterName,
-      reporterPhone,
-      reporterInstagram,
-      contactNote
-    } = req.body;
 
-    const prefix = getIncidentPrefix(incidentType);
-    const number = reportCounters[prefix];
-    const reportId = prefix + String(number).padStart(3, "0");
-    reportCounters[prefix]++;
+    const id = await generateReportID()
 
     const report = {
-      id: reportId,
-      incidentType,
-      description,
-      location,
-      isAnonymous,
-      timestamp,
-      latitude,
-      longitude,
-      isEmergency,
+      id,
+      incidentType: req.body.incidentType || "Unknown",
+      description: req.body.description || "",
+      location: req.body.location || "",
+      latitude: req.body.latitude || null,
+      longitude: req.body.longitude || null,
+      timestamp: new Date().toISOString(),
       status: "open",
-      hasPhoto: !!photoBase64,
-      isMedicalHelp: !!isMedicalHelp,
-      consciousStatus: consciousStatus || null,
-      breathingStatus: breathingStatus || null,
-      approximateAge: approximateAge || null,
-      reporterName: isAnonymous ? null : (reporterName || null),
-      reporterPhone: isAnonymous ? null : (reporterPhone || null),
-      reporterInstagram: isAnonymous ? null : (reporterInstagram || null),
-      contactNote: isAnonymous ? null : (contactNote || null)
-    };
-
-    reports.unshift(report);
-
-    if (reports.length > 500) {
-      reports = reports.slice(0, 500);
+      isEmergency: req.body.isEmergency || false,
+      isAnonymous: req.body.isAnonymous || true,
+      hasPhoto: req.body.hasPhoto || false
     }
 
-    const gpsLink =
-      latitude != null && longitude != null
-        ? `https://maps.google.com/?q=${latitude},${longitude}`
-        : "Location unavailable";
+    await db.collection("reports").doc(id).set(report)
 
-    const contactInfo = isAnonymous
-      ? "Reporter: Anonymous"
-      : `Reporter: ${reporterName || "Not provided"}
-Phone: ${reporterPhone || "Not provided"}
-Instagram: ${reporterInstagram || "Not provided"}
-Note: ${contactNote || "None"}`;
+    const message =
+`🚨 NEW INCIDENT REPORT
 
-    const medicalInfo = isMedicalHelp
-      ? `Medical Help: Yes
-Conscious: ${consciousStatus || "Not provided"}
-Breathing Normally: ${breathingStatus || "Not provided"}
-Approximate Age: ${approximateAge || "Not provided"}`
-      : "Medical Help: No";
+ID: ${report.id}
+Type: ${report.incidentType}
 
-    const message = isEmergency
-      ? `🚨 EMERGENCY ALERT
+Description:
+${report.description}
 
-Incident: ${incidentType}
-Location: ${location || "Not provided"}
-Description: ${description || "Not provided"}
+Location:
+${report.location}
 
-${contactInfo}
+Emergency: ${report.isEmergency ? "YES" : "NO"}`
 
-${medicalInfo}
-
-Report ID: ${reportId}
-
-Map:
-${gpsLink}`
-      : `⚠️ Safety Report
-
-Incident: ${incidentType}
-Location: ${location || "Not provided"}
-Description: ${description || "Not provided"}
-
-${contactInfo}
-
-${medicalInfo}
-
-Report ID: ${reportId}
-
-Map:
-${gpsLink}`;
-
-    await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message
-      }
-    );
-
-    if (photoBase64) {
-      const imageBuffer = Buffer.from(photoBase64, "base64");
-      tempFilePath = path.join(__dirname, `photo_${Date.now()}.jpg`);
-
-      fs.writeFileSync(tempFilePath, imageBuffer);
-
-      const form = new FormData();
-      form.append("chat_id", TELEGRAM_CHAT_ID);
-      form.append("photo", fs.createReadStream(tempFilePath));
-      form.append(
-        "caption",
-        isEmergency
-          ? `🚨 Emergency Incident Photo\nReport ID: ${reportId}`
-          : `📸 Incident Photo\nReport ID: ${reportId}`
-      );
-
-      await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`,
-        form,
-        {
-          headers: form.getHeaders(),
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity
-        }
-      );
-    }
-
-    for (const device of staffDevices) {
-      try {
-        await admin.messaging().send({
-          token: device.fcmToken,
-          notification: {
-            title: isEmergency ? "🚨 Emergency Alert" : "⚠️ New Report",
-            body: `${incidentType} - ${location || "Unknown location"}`
-          },
-          data: {
-            reportId,
-            incidentType: incidentType || "",
-            location: location || "",
-            timestamp: timestamp || "",
-            isEmergency: String(!!isEmergency),
-            isAnonymous: String(!!isAnonymous)
-          },
-          apns: {
-            payload: {
-              aps: {
-                sound: "default"
-              }
-            }
-          }
-        });
-      } catch (error) {
-        console.log("Push failed");
-      }
-    }
+    await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message
+    })
 
     res.json({
       success: true,
-      reportId
-    });
-  } catch (error) {
-    console.error("=== BACKEND ERROR ===");
+      reportID: id
+    })
 
-    if (error.response) {
-      console.error("Status:", error.response.status);
-      console.error("Data:", error.response.data);
-    } else {
-      console.error(error.message);
-    }
+  } catch (error) {
+
+    console.error("Report error:", error)
 
     res.status(500).json({
       success: false,
-      error: "Failed to process report"
-    });
-  } finally {
-    if (tempFilePath && fs.existsSync(tempFilePath)) {
-      fs.unlinkSync(tempFilePath);
-    }
+      error: "Failed to submit report"
+    })
   }
-});
+})
+
+/* ------------------------------------------------ */
+/* GET REPORTS */
+/* ------------------------------------------------ */
+
+app.get("/reports", async (req, res) => {
+
+  try {
+
+    const snapshot = await db.collection("reports").get()
+
+    const reports = snapshot.docs.map(doc => doc.data())
+
+    res.json({
+      success: true,
+      reports
+    })
+
+  } catch (error) {
+
+    console.error("Reports error:", error)
+
+    res.status(500).json({
+      success: false
+    })
+  }
+})
+
+/* ------------------------------------------------ */
+/* GET STAFF USERS */
+/* ------------------------------------------------ */
 
 app.get("/admin/staff-users", async (req, res) => {
+
   try {
-    const access = await verifyAdminAccess(req);
+
+    const access = await verifyAdminAccess(req)
 
     if (!access.ok) {
       return res.status(access.status).json({
         success: false,
         error: access.error
-      });
+      })
     }
 
-    const snapshot = await db.collection("staffUsers").get();
+    const snapshot = await db.collection("staffUsers").get()
 
-    const staffUsers = snapshot.docs.map(doc => ({
-      uid: doc.id,
-      ...doc.data()
-    }));
+    const staffUsers = snapshot.docs.map(doc => {
+
+      const data = doc.data() || {}
+
+      return {
+        uid: doc.id,
+        name: data.name || "",
+        email: data.email || "",
+        role: data.role || "staff",
+        team: data.team || "general",
+        active: data.active ?? false,
+        canManageStaff: data.canManageStaff ?? false,
+        canEditEventInfo: data.canEditEventInfo ?? false,
+        canUseStaffChat: data.canUseStaffChat ?? true,
+        canViewAllReports: data.canViewAllReports ?? true
+      }
+    })
 
     res.json({
       success: true,
       staffUsers
-    });
+    })
+
   } catch (error) {
-    console.error(error);
+
+    console.error("staff-users error:", error)
+
     res.status(500).json({
       success: false,
       error: "Failed to load staff users"
-    });
+    })
   }
-});
+})
+
+/* ------------------------------------------------ */
+/* CREATE STAFF */
+/* ------------------------------------------------ */
 
 app.post("/admin/create-staff", async (req, res) => {
+
   try {
-    const access = await verifyAdminAccess(req);
+
+    const access = await verifyAdminAccess(req)
 
     if (!access.ok) {
       return res.status(access.status).json({
         success: false,
         error: access.error
-      });
+      })
     }
 
     const {
@@ -462,137 +247,123 @@ app.post("/admin/create-staff", async (req, res) => {
       canEditEventInfo,
       canUseStaffChat,
       canViewAllReports
-    } = req.body;
+    } = req.body
 
-    if (!name || !email || !password || !role || !team) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing required fields"
-      });
-    }
-
-    const userRecord = await admin.auth().createUser({
+    const user = await admin.auth().createUser({
       email,
-      password,
-      displayName: name
-    });
+      password
+    })
 
-    await db.collection("staffUsers").document(userRecord.uid).set({
+    const uid = user.uid
+
+    await db.collection("staffUsers").doc(uid).set({
       name,
       email,
       role,
       team,
-      active: active ?? true,
-      canManageStaff: canManageStaff ?? false,
-      canEditEventInfo: canEditEventInfo ?? false,
-      canUseStaffChat: canUseStaffChat ?? true,
-      canViewAllReports: canViewAllReports ?? true,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+      active,
+      canManageStaff,
+      canEditEventInfo,
+      canUseStaffChat,
+      canViewAllReports
+    })
 
     res.json({
       success: true,
-      uid: userRecord.uid
-    });
+      uid
+    })
+
   } catch (error) {
-    console.error(error);
+
+    console.error("create-staff error:", error)
+
     res.status(500).json({
       success: false,
-      error: "Failed to create staff user"
-    });
+      error: "Failed to create staff"
+    })
   }
-});
+})
+
+/* ------------------------------------------------ */
+/* UPDATE STAFF */
+/* ------------------------------------------------ */
 
 app.patch("/admin/update-staff/:uid", async (req, res) => {
+
   try {
-    const access = await verifyAdminAccess(req);
+
+    const access = await verifyAdminAccess(req)
 
     if (!access.ok) {
       return res.status(access.status).json({
         success: false,
         error: access.error
-      });
+      })
     }
 
-    const { uid } = req.params;
+    const uid = req.params.uid
 
-    const {
-      name,
-      role,
-      team,
-      active,
-      canManageStaff,
-      canEditEventInfo,
-      canUseStaffChat,
-      canViewAllReports
-    } = req.body;
-
-    const updates = {};
-
-    if (name !== undefined) updates.name = name;
-    if (role !== undefined) updates.role = role;
-    if (team !== undefined) updates.team = team;
-    if (active !== undefined) updates.active = active;
-    if (canManageStaff !== undefined) updates.canManageStaff = canManageStaff;
-    if (canEditEventInfo !== undefined) updates.canEditEventInfo = canEditEventInfo;
-    if (canUseStaffChat !== undefined) updates.canUseStaffChat = canUseStaffChat;
-    if (canViewAllReports !== undefined) updates.canViewAllReports = canViewAllReports;
-
-    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-
-    await db.collection("staffUsers").document(uid).update(updates);
-
-    if (name !== undefined) {
-      await admin.auth().updateUser(uid, {
-        displayName: name
-      });
-    }
+    await db.collection("staffUsers").doc(uid).update(req.body)
 
     res.json({
       success: true
-    });
+    })
+
   } catch (error) {
-    console.error(error);
+
+    console.error("update-staff error:", error)
+
     res.status(500).json({
       success: false,
-      error: "Failed to update staff user"
-    });
+      error: "Failed to update staff"
+    })
   }
-});
+})
+
+/* ------------------------------------------------ */
+/* TOGGLE STAFF */
+/* ------------------------------------------------ */
 
 app.patch("/admin/toggle-staff/:uid", async (req, res) => {
+
   try {
-    const access = await verifyAdminAccess(req);
+
+    const access = await verifyAdminAccess(req)
 
     if (!access.ok) {
       return res.status(access.status).json({
         success: false,
         error: access.error
-      });
+      })
     }
 
-    const { uid } = req.params;
-    const { active } = req.body;
+    const uid = req.params.uid
+    const active = req.body.active
 
-    await db.collection("staffUsers").document(uid).update({
-      active,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    await db.collection("staffUsers").doc(uid).update({
+      active
+    })
 
     res.json({
       success: true
-    });
+    })
+
   } catch (error) {
-    console.error(error);
+
+    console.error("toggle staff error:", error)
+
     res.status(500).json({
-      success: false,
-      error: "Failed to toggle staff user"
-    });
+      success: false
+    })
   }
-});
+})
 
-const PORT = process.env.PORT || 3000;
+/* ------------------------------------------------ */
+/* SERVER */
+/* ------------------------------------------------ */
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Server running on port " + PORT);
-});
+const PORT = process.env.PORT || 3000
+
+app.listen(PORT, () => {
+  console.log("Server running on port", PORT)
+})
