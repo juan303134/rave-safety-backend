@@ -24,53 +24,77 @@ admin.initializeApp({
 let reports = [];
 let staffDevices = [];
 
+let reportCounters = {
+  MED: 1,
+  HAR: 1,
+  SEC: 1,
+  THE: 1,
+  SUS: 1,
+  GEN: 1
+};
+
+function getIncidentPrefix(type) {
+
+  switch (type) {
+
+    case "Medical Emergency":
+      return "MED";
+
+    case "Harassment":
+      return "HAR";
+
+    case "Violence":
+      return "SEC";
+
+    case "Theft":
+      return "THE";
+
+    case "Suspicious Activity":
+      return "SUS";
+
+    default:
+      return "GEN";
+  }
+}
+
 app.get("/", (req, res) => {
-  res.send("Rave Safety backend is running.");
+  res.send("Rave Safety backend running");
 });
 
 app.post("/staff/register-device", (req, res) => {
+
   const apiKey = req.headers["x-staff-key"];
 
   if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized"
-    });
+    return res.status(401).json({ success: false });
   }
 
-  const { fcmToken, platform } = req.body;
+  const { fcmToken } = req.body;
 
   if (!fcmToken) {
-    return res.status(400).json({
-      success: false,
-      error: "Missing fcmToken"
-    });
+    return res.status(400).json({ success: false });
   }
 
-  const alreadyExists = staffDevices.find(device => device.fcmToken === fcmToken);
+  const exists = staffDevices.find(d => d.fcmToken === fcmToken);
 
-  if (!alreadyExists) {
+  if (!exists) {
+
     staffDevices.push({
       fcmToken,
-      platform: platform || "ios",
       registeredAt: new Date().toISOString()
     });
+
   }
 
-  res.json({
-    success: true,
-    devicesCount: staffDevices.length
-  });
+  res.json({ success: true });
 });
 
 app.get("/reports", (req, res) => {
+
   const apiKey = req.headers["x-staff-key"];
 
   if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized"
-    });
+    return res.status(401).json({ success: false });
   }
 
   res.json({
@@ -80,15 +104,13 @@ app.get("/reports", (req, res) => {
 });
 
 app.get("/report-status/:id", (req, res) => {
+
   const { id } = req.params;
 
-  const report = reports.find(report => report.id === id);
+  const report = reports.find(r => r.id === id);
 
   if (!report) {
-    return res.status(404).json({
-      success: false,
-      error: "Report not found"
-    });
+    return res.status(404).json({ success: false });
   }
 
   res.json({
@@ -104,55 +126,24 @@ app.get("/report-status/:id", (req, res) => {
   });
 });
 
-app.patch("/reports/:id/status", async (req, res) => {
+app.patch("/reports/:id/status", (req, res) => {
+
   const apiKey = req.headers["x-staff-key"];
 
   if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({
-      success: false,
-      error: "Unauthorized"
-    });
+    return res.status(401).json({ success: false });
   }
 
   const { id } = req.params;
   const { status } = req.body;
 
-  const allowedStatuses = ["open", "in_progress", "resolved"];
-
-  if (!allowedStatuses.includes(status)) {
-    return res.status(400).json({
-      success: false,
-      error: "Invalid status"
-    });
-  }
-
-  const reportIndex = reports.findIndex(report => report.id === id);
+  const reportIndex = reports.findIndex(r => r.id === id);
 
   if (reportIndex === -1) {
-    return res.status(404).json({
-      success: false,
-      error: "Report not found"
-    });
+    return res.status(404).json({ success: false });
   }
 
   reports[reportIndex].status = status;
-
-  try {
-    await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        chat_id: TELEGRAM_CHAT_ID,
-        text:
-`🛠️ Incident Status Updated
-
-Incident: ${reports[reportIndex].incidentType}
-New Status: ${status}
-Report ID: ${id}`
-      }
-    );
-  } catch (error) {
-    console.error("Failed to notify Telegram about status update");
-  }
 
   res.json({
     success: true,
@@ -161,9 +152,9 @@ Report ID: ${id}`
 });
 
 app.post("/report", async (req, res) => {
-  let tempFilePath = null;
 
   try {
+
     const {
       incidentType,
       description,
@@ -174,19 +165,21 @@ app.post("/report", async (req, res) => {
       longitude,
       isEmergency,
       photoBase64,
-      isMedicalHelp,
-      consciousStatus,
-      breathingStatus,
-      approximateAge,
       reporterName,
       reporterPhone,
       reporterInstagram,
       contactNote
     } = req.body;
 
-    const reportId = Date.now().toString();
+    const prefix = getIncidentPrefix(incidentType);
 
-    const newReport = {
+    const number = reportCounters[prefix];
+
+    const reportId = prefix + String(number).padStart(3, "0");
+
+    reportCounters[prefix]++;
+
+    const report = {
       id: reportId,
       incidentType,
       description,
@@ -196,73 +189,52 @@ app.post("/report", async (req, res) => {
       latitude,
       longitude,
       isEmergency,
-      hasPhoto: !!photoBase64,
       status: "open",
-      isMedicalHelp: !!isMedicalHelp,
-      consciousStatus: consciousStatus || null,
-      breathingStatus: breathingStatus || null,
-      approximateAge: approximateAge || null,
-      reporterName: isAnonymous ? null : (reporterName || null),
-      reporterPhone: isAnonymous ? null : (reporterPhone || null),
-      reporterInstagram: isAnonymous ? null : (reporterInstagram || null),
-      contactNote: isAnonymous ? null : (contactNote || null)
+      hasPhoto: !!photoBase64,
+      reporterName,
+      reporterPhone,
+      reporterInstagram,
+      contactNote
     };
 
-    reports.unshift(newReport);
-
-    if (reports.length > 200) {
-      reports = reports.slice(0, 200);
-    }
+    reports.unshift(report);
 
     const gpsLink =
       latitude != null && longitude != null
         ? `https://maps.google.com/?q=${latitude},${longitude}`
-        : "Not available";
+        : "Location unavailable";
 
     const contactInfo = isAnonymous
       ? "Reporter: Anonymous"
       : `Reporter: ${reporterName || "Not provided"}
 Phone: ${reporterPhone || "Not provided"}
 Instagram: ${reporterInstagram || "Not provided"}
-Contact Note: ${contactNote || "Not provided"}`;
-
-    const medicalInfo = isMedicalHelp
-      ? `Medical Help: Yes
-Conscious: ${consciousStatus || "Not provided"}
-Breathing Normally: ${breathingStatus || "Not provided"}
-Approximate Age: ${approximateAge || "Not provided"}`
-      : "Medical Help: No";
+Note: ${contactNote || "None"}`;
 
     const message = isEmergency
-      ? `🚨🚨🚨 EMERGENCY ALERT 🚨🚨🚨
-
-NEEDS IMMEDIATE ATTENTION
+      ? `🚨 EMERGENCY ALERT
 
 Incident: ${incidentType}
-Location: ${location || "Not provided"}
+Location: ${location}
 Description: ${description}
-Anonymous: ${isAnonymous ? "Yes" : "No"}
-Time: ${timestamp}
 
 ${contactInfo}
 
-${medicalInfo}
+Report ID: ${reportId}
 
-📍 Live Map:
+Map:
 ${gpsLink}`
-      : `⚠️ New Safety Report
+      : `⚠️ Safety Report
 
 Incident: ${incidentType}
-Location: ${location || "Not provided"}
+Location: ${location}
 Description: ${description}
-Anonymous: ${isAnonymous ? "Yes" : "No"}
-Time: ${timestamp}
 
 ${contactInfo}
 
-${medicalInfo}
+Report ID: ${reportId}
 
-📍 Map Location:
+Map:
 ${gpsLink}`;
 
     await axios.post(
@@ -274,62 +246,45 @@ ${gpsLink}`;
     );
 
     if (photoBase64) {
-      const imageBuffer = Buffer.from(photoBase64, "base64");
-      tempFilePath = path.join(__dirname, `incident_${Date.now()}.jpg`);
 
-      fs.writeFileSync(tempFilePath, imageBuffer);
+      const imageBuffer = Buffer.from(photoBase64, "base64");
+
+      const tempFile = path.join(__dirname, `photo_${Date.now()}.jpg`);
+
+      fs.writeFileSync(tempFile, imageBuffer);
 
       const form = new FormData();
       form.append("chat_id", TELEGRAM_CHAT_ID);
-      form.append("photo", fs.createReadStream(tempFilePath));
-      form.append(
-        "caption",
-        isEmergency ? "🚨 Emergency Incident Photo" : "📸 Incident Photo"
-      );
+      form.append("photo", fs.createReadStream(tempFile));
 
       await axios.post(
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`,
         form,
         {
-          headers: form.getHeaders(),
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity
+          headers: form.getHeaders()
         }
       );
+
+      fs.unlinkSync(tempFile);
     }
 
-    const notificationTitle = isEmergency
-      ? "🚨 Emergency Alert"
-      : "⚠️ New Incident Report";
-
-    const notificationBody = `${incidentType} - ${location || "Unknown location"}`;
-
     for (const device of staffDevices) {
+
       try {
+
         await admin.messaging().send({
           token: device.fcmToken,
           notification: {
-            title: notificationTitle,
-            body: notificationBody
+            title: isEmergency ? "🚨 Emergency Alert" : "⚠️ New Report",
+            body: `${incidentType} - ${location}`
           },
           data: {
-            reportId,
-            incidentType: incidentType || "",
-            location: location || "",
-            timestamp: timestamp || "",
-            isEmergency: String(!!isEmergency),
-            isAnonymous: String(!!isAnonymous)
-          },
-          apns: {
-            payload: {
-              aps: {
-                sound: "default"
-              }
-            }
+            reportId
           }
         });
-      } catch (pushError) {
-        console.error("Push send failed:", pushError.message);
+
+      } catch (error) {
+        console.log("Push failed");
       }
     }
 
@@ -337,28 +292,20 @@ ${gpsLink}`;
       success: true,
       reportId
     });
-  } catch (error) {
-    console.error("=== BACKEND ERROR ===");
 
-    if (error.response) {
-      console.error("Status:", error.response.status);
-      console.error("Data:", error.response.data);
-    } else {
-      console.error(error.message);
-    }
+  } catch (error) {
+
+    console.log(error);
 
     res.status(500).json({
-      success: false,
-      error: "Failed to process report"
+      success: false
     });
-  } finally {
-    if (tempFilePath && fs.existsSync(tempFilePath)) {
-      fs.unlinkSync(tempFilePath);
-    }
+
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
+
+app.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
 });
