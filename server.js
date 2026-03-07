@@ -25,17 +25,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-let reports = [];
 let staffDevices = [];
-
-let reportCounters = {
-  MED: 1,
-  HAR: 1,
-  SEC: 1,
-  THE: 1,
-  SUS: 1,
-  GEN: 1
-};
 
 function getIncidentPrefix(type) {
   switch (type) {
@@ -52,6 +42,27 @@ function getIncidentPrefix(type) {
     default:
       return "GEN";
   }
+}
+
+async function generateReportId(incidentType) {
+  const prefix = getIncidentPrefix(incidentType);
+  const counterRef = db.collection("system").doc(`reportCounter_${prefix}`);
+
+  const newNumber = await db.runTransaction(async (transaction) => {
+    const counterDoc = await transaction.get(counterRef);
+
+    let current = 0;
+    if (counterDoc.exists) {
+      current = counterDoc.data().value || 0;
+    }
+
+    const next = current + 1;
+
+    transaction.set(counterRef, { value: next }, { merge: true });
+    return next;
+  });
+
+  return prefix + String(newNumber).padStart(3, "0");
 }
 
 async function verifyAdminAccess(req) {
@@ -119,7 +130,7 @@ app.post("/staff/register-device", (req, res) => {
       });
     }
 
-    const exists = staffDevices.find(d => d.fcmToken === fcmToken);
+    const exists = staffDevices.find((d) => d.fcmToken === fcmToken);
 
     if (!exists) {
       staffDevices.push({
@@ -142,7 +153,7 @@ app.post("/staff/register-device", (req, res) => {
   }
 });
 
-app.get("/reports", (req, res) => {
+app.get("/reports", async (req, res) => {
   try {
     const apiKey = req.headers["x-staff-key"];
 
@@ -152,6 +163,13 @@ app.get("/reports", (req, res) => {
         error: "Unauthorized"
       });
     }
+
+    const snapshot = await db
+      .collection("reports")
+      .orderBy("createdAt", "desc")
+      .get();
+
+    const reports = snapshot.docs.map((doc) => doc.data());
 
     res.json({
       success: true,
@@ -166,18 +184,20 @@ app.get("/reports", (req, res) => {
   }
 });
 
-app.get("/report-status/:id", (req, res) => {
+app.get("/report-status/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    const report = reports.find(r => r.id === id);
+    const doc = await db.collection("reports").doc(id).get();
 
-    if (!report) {
+    if (!doc.exists) {
       return res.status(404).json({
         success: false,
         error: "Report not found"
       });
     }
+
+    const report = doc.data();
 
     res.json({
       success: true,
@@ -222,16 +242,23 @@ app.patch("/reports/:id/status", async (req, res) => {
       });
     }
 
-    const reportIndex = reports.findIndex(r => r.id === id);
+    const reportRef = db.collection("reports").doc(id);
+    const reportDoc = await reportRef.get();
 
-    if (reportIndex === -1) {
+    if (!reportDoc.exists) {
       return res.status(404).json({
         success: false,
         error: "Report not found"
       });
     }
 
-    reports[reportIndex].status = status;
+    await reportRef.update({
+      status,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const updatedDoc = await reportRef.get();
+    const updatedReport = updatedDoc.data();
 
     try {
       await axios.post(
@@ -241,18 +268,21 @@ app.patch("/reports/:id/status", async (req, res) => {
           text:
 `🛠️ Incident Status Updated
 
-Incident: ${reports[reportIndex].incidentType}
+Incident: ${updatedReport.incidentType}
 New Status: ${status}
 Report ID: ${id}`
         }
       );
     } catch (telegramError) {
-      console.error("Telegram status update error:", telegramError.response?.data || telegramError.message);
+      console.error(
+        "Telegram status update error:",
+        telegramError.response?.data || telegramError.message
+      );
     }
 
     res.json({
       success: true,
-      report: reports[reportIndex]
+      report: updatedReport
     });
   } catch (error) {
     console.error("patch report status error:", error);
@@ -287,10 +317,7 @@ app.post("/report", async (req, res) => {
       contactNote
     } = req.body;
 
-    const prefix = getIncidentPrefix(incidentType);
-    const number = reportCounters[prefix];
-    const reportId = prefix + String(number).padStart(3, "0");
-    reportCounters[prefix]++;
+    const reportId = await generateReportId(incidentType);
 
     const report = {
       id: reportId,
@@ -311,14 +338,12 @@ app.post("/report", async (req, res) => {
       reporterName: isAnonymous ? null : (reporterName || null),
       reporterPhone: isAnonymous ? null : (reporterPhone || null),
       reporterInstagram: isAnonymous ? null : (reporterInstagram || null),
-      contactNote: isAnonymous ? null : (contactNote || null)
+      contactNote: isAnonymous ? null : (contactNote || null),
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
     };
 
-    reports.unshift(report);
-
-    if (reports.length > 500) {
-      reports = reports.slice(0, 500);
-    }
+    await db.collection("reports").doc(reportId).set(report);
 
     const gpsLink =
       latitude != null && longitude != null
@@ -470,7 +495,7 @@ app.get("/admin/staff-users", async (req, res) => {
 
     const snapshot = await db.collection("staffUsers").get();
 
-    const staffUsers = snapshot.docs.map(doc => {
+    const staffUsers = snapshot.docs.map((doc) => {
       const data = doc.data() || {};
 
       return {
