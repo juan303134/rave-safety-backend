@@ -89,6 +89,16 @@ app.get("/", (req, res) => {
   res.send("Rave Safety backend running");
 });
 
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    telegramBot: !!process.env.TELEGRAM_BOT_TOKEN,
+    telegramChat: !!process.env.TELEGRAM_CHAT_ID,
+    firebaseJson: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
+    staffApiKey: !!process.env.STAFF_API_KEY
+  });
+});
+
 app.post("/staff/register-device", (req, res) => {
   try {
     const apiKey = req.headers["x-staff-key"];
@@ -294,7 +304,7 @@ app.post("/report", async (req, res) => {
       isEmergency: !!isEmergency,
       status: "open",
       hasPhoto: !!photoBase64,
-      isMedicalHelp: !!isMedicalHelp,
+      isMedicalHelp: isMedicalHelp === true,
       consciousStatus: consciousStatus || null,
       breathingStatus: breathingStatus || null,
       approximateAge: approximateAge || null,
@@ -322,12 +332,14 @@ Phone: ${reporterPhone || "Not provided"}
 Instagram: ${reporterInstagram || "Not provided"}
 Note: ${contactNote || "None"}`;
 
-    const medicalInfo = isMedicalHelp
-      ? `Medical Help: Yes
+    let medicalInfo = "";
+
+    if (isMedicalHelp === true) {
+      medicalInfo = `Medical Assistance Needed: Yes
 Conscious: ${consciousStatus || "Not provided"}
 Breathing Normally: ${breathingStatus || "Not provided"}
-Approximate Age: ${approximateAge || "Not provided"}`
-      : "Medical Help: No";
+Approximate Age: ${approximateAge || "Not provided"}`;
+    }
 
     const message = isEmergency
       ? `🚨 EMERGENCY ALERT
@@ -336,9 +348,7 @@ Incident: ${incidentType || "Other"}
 Location: ${location || "Not provided"}
 Description: ${description || "Not provided"}
 
-${contactInfo}
-
-${medicalInfo}
+${contactInfo}${medicalInfo ? `\n\n${medicalInfo}` : ""}
 
 Report ID: ${reportId}
 
@@ -350,9 +360,7 @@ Incident: ${incidentType || "Other"}
 Location: ${location || "Not provided"}
 Description: ${description || "Not provided"}
 
-${contactInfo}
-
-${medicalInfo}
+${contactInfo}${medicalInfo ? `\n\n${medicalInfo}` : ""}
 
 Report ID: ${reportId}
 
@@ -523,6 +531,13 @@ app.post("/admin/create-staff", async (req, res) => {
       });
     }
 
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: "Password must be at least 6 characters"
+      });
+    }
+
     const userRecord = await admin.auth().createUser({
       email,
       password,
@@ -548,6 +563,28 @@ app.post("/admin/create-staff", async (req, res) => {
     });
   } catch (error) {
     console.error("POST /admin/create-staff error:", error);
+
+    if (error.code === "auth/email-already-exists") {
+      return res.status(400).json({
+        success: false,
+        error: "That email is already registered"
+      });
+    }
+
+    if (error.code === "auth/invalid-password") {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid password"
+      });
+    }
+
+    if (error.code === "auth/invalid-email") {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid email address"
+      });
+    }
+
     res.status(500).json({
       success: false,
       error: "Failed to create staff"
