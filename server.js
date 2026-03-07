@@ -164,16 +164,39 @@ app.get("/reports", async (req, res) => {
       });
     }
 
-    const snapshot = await db
+    const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
+    const cursor = req.query.cursor;
+
+    let query = db
       .collection("reports")
       .orderBy("createdAt", "desc")
-      .get();
+      .limit(limit);
+
+    if (cursor) {
+      const cursorDoc = await db.collection("reports").doc(cursor).get();
+
+      if (cursorDoc.exists) {
+        query = db
+          .collection("reports")
+          .orderBy("createdAt", "desc")
+          .startAfter(cursorDoc)
+          .limit(limit);
+      }
+    }
+
+    const snapshot = await query.get();
 
     const reports = snapshot.docs.map((doc) => doc.data());
 
+    const lastDoc = snapshot.docs.length > 0 ? snapshot.docs[snapshot.docs.length - 1] : null;
+    const nextCursor = lastDoc ? lastDoc.id : null;
+    const hasMore = snapshot.docs.length === limit;
+
     res.json({
       success: true,
-      reports
+      reports,
+      nextCursor,
+      hasMore
     });
   } catch (error) {
     console.error("get reports error:", error);
