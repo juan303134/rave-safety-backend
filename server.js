@@ -4,6 +4,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const FormData = require("form-data");
+const admin = require("firebase-admin");
 
 const app = express();
 
@@ -14,10 +15,52 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const STAFF_API_KEY = process.env.STAFF_API_KEY || "staff123";
 
+const firebaseServiceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+
+admin.initializeApp({
+  credential: admin.credential.cert(firebaseServiceAccount)
+});
+
 let reports = [];
+let staffDevices = [];
 
 app.get("/", (req, res) => {
   res.send("Rave Safety backend is running.");
+});
+
+app.post("/staff/register-device", (req, res) => {
+  const apiKey = req.headers["x-staff-key"];
+
+  if (apiKey !== STAFF_API_KEY) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized"
+    });
+  }
+
+  const { fcmToken, platform } = req.body;
+
+  if (!fcmToken) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing fcmToken"
+    });
+  }
+
+  const alreadyExists = staffDevices.find(device => device.fcmToken === fcmToken);
+
+  if (!alreadyExists) {
+    staffDevices.push({
+      fcmToken,
+      platform: platform || "ios",
+      registeredAt: new Date().toISOString()
+    });
+  }
+
+  res.json({
+    success: true,
+    devicesCount: staffDevices.length
+  });
 });
 
 app.get("/reports", (req, res) => {
@@ -192,11 +235,44 @@ ${gpsLink}`;
       );
     }
 
+    const notificationTitle = isEmergency
+      ? "🚨 Emergency Alert"
+      : "⚠️ New Incident Report";
+
+    const notificationBody = `${incidentType} - ${location || "Unknown location"}`;
+
+    for (const device of staffDevices) {
+      try {
+        await admin.messaging().send({
+          token: device.fcmToken,
+          notification: {
+            title: notificationTitle,
+            body: notificationBody
+          },
+          data: {
+            incidentType: incidentType || "",
+            location: location || "",
+            timestamp: timestamp || "",
+            isEmergency: String(!!isEmergency)
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: "default"
+              }
+            }
+          }
+        });
+      } catch (pushError) {
+        console.error("Push send failed:", pushError.message);
+      }
+    }
+
     res.json({
       success: true
     });
   } catch (error) {
-    console.error("=== TELEGRAM ERROR ===");
+    console.error("=== BACKEND ERROR ===");
 
     if (error.response) {
       console.error("Status:", error.response.status);
@@ -207,7 +283,7 @@ ${gpsLink}`;
 
     res.status(500).json({
       success: false,
-      error: "Failed to send report to Telegram"
+      error: "Failed to process report"
     });
   } finally {
     if (tempFilePath && fs.existsSync(tempFilePath)) {
