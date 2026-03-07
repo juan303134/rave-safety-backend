@@ -186,7 +186,15 @@ app.get("/reports", async (req, res) => {
 
     const snapshot = await query.get();
 
-    const reports = snapshot.docs.map((doc) => doc.data());
+    const reports = snapshot.docs.map((doc) => {
+      const data = doc.data();
+
+      return {
+        ...data,
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt,
+        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate().toISOString() : data.updatedAt
+      };
+    });
 
     const lastDoc = snapshot.docs.length > 0 ? snapshot.docs[snapshot.docs.length - 1] : null;
     const nextCursor = lastDoc ? lastDoc.id : null;
@@ -502,6 +510,87 @@ ${gpsLink}`;
     if (tempFilePath && fs.existsSync(tempFilePath)) {
       fs.unlinkSync(tempFilePath);
     }
+  }
+});
+
+app.delete("/admin/reports/:id", async (req, res) => {
+  try {
+    const access = await verifyAdminAccess(req);
+
+    if (!access.ok) {
+      return res.status(access.status).json({
+        success: false,
+        error: access.error
+      });
+    }
+
+    const { id } = req.params;
+
+    const reportRef = db.collection("reports").doc(id);
+    const reportDoc = await reportRef.get();
+
+    if (!reportDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Report not found"
+      });
+    }
+
+    await reportRef.delete();
+
+    res.json({
+      success: true,
+      message: `Report ${id} deleted`
+    });
+  } catch (error) {
+    console.error("DELETE /admin/reports/:id error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to delete report"
+    });
+  }
+});
+
+app.delete("/admin/reports", async (req, res) => {
+  try {
+    const access = await verifyAdminAccess(req);
+
+    if (!access.ok) {
+      return res.status(access.status).json({
+        success: false,
+        error: access.error
+      });
+    }
+
+    const snapshot = await db.collection("reports").get();
+    const docs = snapshot.docs;
+
+    let deletedCount = 0;
+    const batchSize = 400;
+
+    for (let i = 0; i < docs.length; i += batchSize) {
+      const batch = db.batch();
+      const chunk = docs.slice(i, i + batchSize);
+
+      chunk.forEach((doc) => {
+        batch.delete(doc.ref);
+        deletedCount += 1;
+      });
+
+      await batch.commit();
+    }
+
+    res.json({
+      success: true,
+      message: "All reports deleted",
+      deletedCount
+    });
+  } catch (error) {
+    console.error("DELETE /admin/reports error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to delete all reports"
+    });
   }
 });
 
