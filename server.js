@@ -14,14 +14,12 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const STAFF_API_KEY = process.env.STAFF_API_KEY || "staff123";
 
-// memoria temporal de reportes
 let reports = [];
 
 app.get("/", (req, res) => {
   res.send("Rave Safety backend is running.");
 });
 
-// endpoint para staff
 app.get("/reports", (req, res) => {
   const apiKey = req.headers["x-staff-key"];
 
@@ -35,6 +33,62 @@ app.get("/reports", (req, res) => {
   res.json({
     success: true,
     reports
+  });
+});
+
+app.patch("/reports/:id/status", async (req, res) => {
+  const apiKey = req.headers["x-staff-key"];
+
+  if (apiKey !== STAFF_API_KEY) {
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized"
+    });
+  }
+
+  const { id } = req.params;
+  const { status } = req.body;
+
+  const allowedStatuses = ["open", "in_progress", "resolved"];
+
+  if (!allowedStatuses.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid status"
+    });
+  }
+
+  const reportIndex = reports.findIndex(report => report.id === id);
+
+  if (reportIndex === -1) {
+    return res.status(404).json({
+      success: false,
+      error: "Report not found"
+    });
+  }
+
+  reports[reportIndex].status = status;
+
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: TELEGRAM_CHAT_ID,
+        text:
+`🛠️ Incident Status Updated
+
+Incident: ${reports[reportIndex].incidentType}
+New Status: ${status}
+Report ID: ${id}`
+      }
+    );
+  } catch (error) {
+    console.error("Failed to notify Telegram about status update");
+  }
+
+  res.json({
+    success: true,
+    report: reports[reportIndex]
   });
 });
 
@@ -70,10 +124,8 @@ app.post("/report", async (req, res) => {
       status: "open"
     };
 
-    // guardar al principio para que el más reciente salga primero
     reports.unshift(newReport);
 
-    // limitar memoria a últimos 200
     if (reports.length > 200) {
       reports = reports.slice(0, 200);
     }
