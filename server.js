@@ -79,6 +79,31 @@ app.get("/reports", (req, res) => {
   });
 });
 
+app.get("/report-status/:id", (req, res) => {
+  const { id } = req.params;
+
+  const report = reports.find(report => report.id === id);
+
+  if (!report) {
+    return res.status(404).json({
+      success: false,
+      error: "Report not found"
+    });
+  }
+
+  res.json({
+    success: true,
+    report: {
+      id: report.id,
+      incidentType: report.incidentType,
+      status: report.status,
+      location: report.location,
+      timestamp: report.timestamp,
+      isEmergency: report.isEmergency
+    }
+  });
+});
+
 app.patch("/reports/:id/status", async (req, res) => {
   const apiKey = req.headers["x-staff-key"];
 
