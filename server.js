@@ -21,6 +21,8 @@ admin.initializeApp({
   credential: admin.credential.cert(firebaseServiceAccount)
 });
 
+const db = admin.firestore();
+
 let reports = [];
 let staffDevices = [];
 
@@ -34,27 +36,46 @@ let reportCounters = {
 };
 
 function getIncidentPrefix(type) {
-
   switch (type) {
-
     case "Medical Emergency":
       return "MED";
-
     case "Harassment":
       return "HAR";
-
     case "Violence":
       return "SEC";
-
     case "Theft":
       return "THE";
-
     case "Suspicious Activity":
       return "SUS";
-
     default:
       return "GEN";
   }
+}
+
+async function verifyAdminAccess(req) {
+  const uid = req.headers["x-staff-uid"];
+
+  if (!uid) {
+    return { ok: false, status: 401, error: "Missing staff uid" };
+  }
+
+  const staffDoc = await db.collection("staffUsers").document(uid).get();
+
+  if (!staffDoc.exists) {
+    return { ok: false, status: 403, error: "Staff profile not found" };
+  }
+
+  const data = staffDoc.data();
+
+  if (!data.active) {
+    return { ok: false, status: 403, error: "Staff account inactive" };
+  }
+
+  if (!data.canManageStaff) {
+    return { ok: false, status: 403, error: "No permission to manage staff" };
+  }
+
+  return { ok: true, uid, profile: data };
 }
 
 app.get("/", (req, res) => {
@@ -62,39 +83,48 @@ app.get("/", (req, res) => {
 });
 
 app.post("/staff/register-device", (req, res) => {
-
   const apiKey = req.headers["x-staff-key"];
 
   if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({ success: false });
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized"
+    });
   }
 
-  const { fcmToken } = req.body;
+  const { fcmToken, platform } = req.body;
 
   if (!fcmToken) {
-    return res.status(400).json({ success: false });
+    return res.status(400).json({
+      success: false,
+      error: "Missing token"
+    });
   }
 
   const exists = staffDevices.find(d => d.fcmToken === fcmToken);
 
   if (!exists) {
-
     staffDevices.push({
       fcmToken,
+      platform: platform || "ios",
       registeredAt: new Date().toISOString()
     });
-
   }
 
-  res.json({ success: true });
+  res.json({
+    success: true,
+    devicesCount: staffDevices.length
+  });
 });
 
 app.get("/reports", (req, res) => {
-
   const apiKey = req.headers["x-staff-key"];
 
   if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({ success: false });
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized"
+    });
   }
 
   res.json({
@@ -104,13 +134,15 @@ app.get("/reports", (req, res) => {
 });
 
 app.get("/report-status/:id", (req, res) => {
-
   const { id } = req.params;
 
   const report = reports.find(r => r.id === id);
 
   if (!report) {
-    return res.status(404).json({ success: false });
+    return res.status(404).json({
+      success: false,
+      error: "Report not found"
+    });
   }
 
   res.json({
@@ -126,24 +158,55 @@ app.get("/report-status/:id", (req, res) => {
   });
 });
 
-app.patch("/reports/:id/status", (req, res) => {
-
+app.patch("/reports/:id/status", async (req, res) => {
   const apiKey = req.headers["x-staff-key"];
 
   if (apiKey !== STAFF_API_KEY) {
-    return res.status(401).json({ success: false });
+    return res.status(401).json({
+      success: false,
+      error: "Unauthorized"
+    });
   }
 
   const { id } = req.params;
   const { status } = req.body;
 
+  const allowedStatuses = ["open", "in_progress", "resolved"];
+
+  if (!allowedStatuses.includes(status)) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid status"
+    });
+  }
+
   const reportIndex = reports.findIndex(r => r.id === id);
 
   if (reportIndex === -1) {
-    return res.status(404).json({ success: false });
+    return res.status(404).json({
+      success: false,
+      error: "Report not found"
+    });
   }
 
   reports[reportIndex].status = status;
+
+  try {
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: TELEGRAM_CHAT_ID,
+        text:
+`🛠️ Incident Status Updated
+
+Incident: ${reports[reportIndex].incidentType}
+New Status: ${status}
+Report ID: ${id}`
+      }
+    );
+  } catch (error) {
+    console.error("Failed to notify Telegram about status update");
+  }
 
   res.json({
     success: true,
@@ -152,9 +215,9 @@ app.patch("/reports/:id/status", (req, res) => {
 });
 
 app.post("/report", async (req, res) => {
+  let tempFilePath = null;
 
   try {
-
     const {
       incidentType,
       description,
@@ -165,6 +228,10 @@ app.post("/report", async (req, res) => {
       longitude,
       isEmergency,
       photoBase64,
+      isMedicalHelp,
+      consciousStatus,
+      breathingStatus,
+      approximateAge,
       reporterName,
       reporterPhone,
       reporterInstagram,
@@ -172,11 +239,8 @@ app.post("/report", async (req, res) => {
     } = req.body;
 
     const prefix = getIncidentPrefix(incidentType);
-
     const number = reportCounters[prefix];
-
     const reportId = prefix + String(number).padStart(3, "0");
-
     reportCounters[prefix]++;
 
     const report = {
@@ -191,13 +255,21 @@ app.post("/report", async (req, res) => {
       isEmergency,
       status: "open",
       hasPhoto: !!photoBase64,
-      reporterName,
-      reporterPhone,
-      reporterInstagram,
-      contactNote
+      isMedicalHelp: !!isMedicalHelp,
+      consciousStatus: consciousStatus || null,
+      breathingStatus: breathingStatus || null,
+      approximateAge: approximateAge || null,
+      reporterName: isAnonymous ? null : (reporterName || null),
+      reporterPhone: isAnonymous ? null : (reporterPhone || null),
+      reporterInstagram: isAnonymous ? null : (reporterInstagram || null),
+      contactNote: isAnonymous ? null : (contactNote || null)
     };
 
     reports.unshift(report);
+
+    if (reports.length > 500) {
+      reports = reports.slice(0, 500);
+    }
 
     const gpsLink =
       latitude != null && longitude != null
@@ -211,14 +283,23 @@ Phone: ${reporterPhone || "Not provided"}
 Instagram: ${reporterInstagram || "Not provided"}
 Note: ${contactNote || "None"}`;
 
+    const medicalInfo = isMedicalHelp
+      ? `Medical Help: Yes
+Conscious: ${consciousStatus || "Not provided"}
+Breathing Normally: ${breathingStatus || "Not provided"}
+Approximate Age: ${approximateAge || "Not provided"}`
+      : "Medical Help: No";
+
     const message = isEmergency
       ? `🚨 EMERGENCY ALERT
 
 Incident: ${incidentType}
-Location: ${location}
-Description: ${description}
+Location: ${location || "Not provided"}
+Description: ${description || "Not provided"}
 
 ${contactInfo}
+
+${medicalInfo}
 
 Report ID: ${reportId}
 
@@ -227,10 +308,12 @@ ${gpsLink}`
       : `⚠️ Safety Report
 
 Incident: ${incidentType}
-Location: ${location}
-Description: ${description}
+Location: ${location || "Not provided"}
+Description: ${description || "Not provided"}
 
 ${contactInfo}
+
+${medicalInfo}
 
 Report ID: ${reportId}
 
@@ -246,43 +329,56 @@ ${gpsLink}`;
     );
 
     if (photoBase64) {
-
       const imageBuffer = Buffer.from(photoBase64, "base64");
+      tempFilePath = path.join(__dirname, `photo_${Date.now()}.jpg`);
 
-      const tempFile = path.join(__dirname, `photo_${Date.now()}.jpg`);
-
-      fs.writeFileSync(tempFile, imageBuffer);
+      fs.writeFileSync(tempFilePath, imageBuffer);
 
       const form = new FormData();
       form.append("chat_id", TELEGRAM_CHAT_ID);
-      form.append("photo", fs.createReadStream(tempFile));
+      form.append("photo", fs.createReadStream(tempFilePath));
+      form.append(
+        "caption",
+        isEmergency
+          ? `🚨 Emergency Incident Photo\nReport ID: ${reportId}`
+          : `📸 Incident Photo\nReport ID: ${reportId}`
+      );
 
       await axios.post(
         `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`,
         form,
         {
-          headers: form.getHeaders()
+          headers: form.getHeaders(),
+          maxContentLength: Infinity,
+          maxBodyLength: Infinity
         }
       );
-
-      fs.unlinkSync(tempFile);
     }
 
     for (const device of staffDevices) {
-
       try {
-
         await admin.messaging().send({
           token: device.fcmToken,
           notification: {
             title: isEmergency ? "🚨 Emergency Alert" : "⚠️ New Report",
-            body: `${incidentType} - ${location}`
+            body: `${incidentType} - ${location || "Unknown location"}`
           },
           data: {
-            reportId
+            reportId,
+            incidentType: incidentType || "",
+            location: location || "",
+            timestamp: timestamp || "",
+            isEmergency: String(!!isEmergency),
+            isAnonymous: String(!!isAnonymous)
+          },
+          apns: {
+            payload: {
+              aps: {
+                sound: "default"
+              }
+            }
           }
         });
-
       } catch (error) {
         console.log("Push failed");
       }
@@ -292,20 +388,211 @@ ${gpsLink}`;
       success: true,
       reportId
     });
-
   } catch (error) {
+    console.error("=== BACKEND ERROR ===");
 
-    console.log(error);
+    if (error.response) {
+      console.error("Status:", error.response.status);
+      console.error("Data:", error.response.data);
+    } else {
+      console.error(error.message);
+    }
 
     res.status(500).json({
-      success: false
+      success: false,
+      error: "Failed to process report"
+    });
+  } finally {
+    if (tempFilePath && fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+    }
+  }
+});
+
+app.get("/admin/staff-users", async (req, res) => {
+  try {
+    const access = await verifyAdminAccess(req);
+
+    if (!access.ok) {
+      return res.status(access.status).json({
+        success: false,
+        error: access.error
+      });
+    }
+
+    const snapshot = await db.collection("staffUsers").get();
+
+    const staffUsers = snapshot.docs.map(doc => ({
+      uid: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({
+      success: true,
+      staffUsers
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to load staff users"
+    });
+  }
+});
+
+app.post("/admin/create-staff", async (req, res) => {
+  try {
+    const access = await verifyAdminAccess(req);
+
+    if (!access.ok) {
+      return res.status(access.status).json({
+        success: false,
+        error: access.error
+      });
+    }
+
+    const {
+      name,
+      email,
+      password,
+      role,
+      team,
+      active,
+      canManageStaff,
+      canEditEventInfo,
+      canUseStaffChat,
+      canViewAllReports
+    } = req.body;
+
+    if (!name || !email || !password || !role || !team) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields"
+      });
+    }
+
+    const userRecord = await admin.auth().createUser({
+      email,
+      password,
+      displayName: name
     });
 
+    await db.collection("staffUsers").document(userRecord.uid).set({
+      name,
+      email,
+      role,
+      team,
+      active: active ?? true,
+      canManageStaff: canManageStaff ?? false,
+      canEditEventInfo: canEditEventInfo ?? false,
+      canUseStaffChat: canUseStaffChat ?? true,
+      canViewAllReports: canViewAllReports ?? true,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true,
+      uid: userRecord.uid
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to create staff user"
+    });
+  }
+});
+
+app.patch("/admin/update-staff/:uid", async (req, res) => {
+  try {
+    const access = await verifyAdminAccess(req);
+
+    if (!access.ok) {
+      return res.status(access.status).json({
+        success: false,
+        error: access.error
+      });
+    }
+
+    const { uid } = req.params;
+
+    const {
+      name,
+      role,
+      team,
+      active,
+      canManageStaff,
+      canEditEventInfo,
+      canUseStaffChat,
+      canViewAllReports
+    } = req.body;
+
+    const updates = {};
+
+    if (name !== undefined) updates.name = name;
+    if (role !== undefined) updates.role = role;
+    if (team !== undefined) updates.team = team;
+    if (active !== undefined) updates.active = active;
+    if (canManageStaff !== undefined) updates.canManageStaff = canManageStaff;
+    if (canEditEventInfo !== undefined) updates.canEditEventInfo = canEditEventInfo;
+    if (canUseStaffChat !== undefined) updates.canUseStaffChat = canUseStaffChat;
+    if (canViewAllReports !== undefined) updates.canViewAllReports = canViewAllReports;
+
+    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+
+    await db.collection("staffUsers").document(uid).update(updates);
+
+    if (name !== undefined) {
+      await admin.auth().updateUser(uid, {
+        displayName: name
+      });
+    }
+
+    res.json({
+      success: true
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to update staff user"
+    });
+  }
+});
+
+app.patch("/admin/toggle-staff/:uid", async (req, res) => {
+  try {
+    const access = await verifyAdminAccess(req);
+
+    if (!access.ok) {
+      return res.status(access.status).json({
+        success: false,
+        error: access.error
+      });
+    }
+
+    const { uid } = req.params;
+    const { active } = req.body;
+
+    await db.collection("staffUsers").document(uid).update({
+      active,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to toggle staff user"
+    });
   }
 });
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port " + PORT);
 });
