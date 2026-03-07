@@ -148,7 +148,15 @@ app.post("/report", async (req, res) => {
       latitude,
       longitude,
       isEmergency,
-      photoBase64
+      photoBase64,
+      isMedicalHelp,
+      consciousStatus,
+      breathingStatus,
+      approximateAge,
+      reporterName,
+      reporterPhone,
+      reporterInstagram,
+      contactNote
     } = req.body;
 
     const reportId = Date.now().toString();
@@ -164,7 +172,15 @@ app.post("/report", async (req, res) => {
       longitude,
       isEmergency,
       hasPhoto: !!photoBase64,
-      status: "open"
+      status: "open",
+      isMedicalHelp: !!isMedicalHelp,
+      consciousStatus: consciousStatus || null,
+      breathingStatus: breathingStatus || null,
+      approximateAge: approximateAge || null,
+      reporterName: isAnonymous ? null : (reporterName || null),
+      reporterPhone: isAnonymous ? null : (reporterPhone || null),
+      reporterInstagram: isAnonymous ? null : (reporterInstagram || null),
+      contactNote: isAnonymous ? null : (contactNote || null)
     };
 
     reports.unshift(newReport);
@@ -178,6 +194,20 @@ app.post("/report", async (req, res) => {
         ? `https://maps.google.com/?q=${latitude},${longitude}`
         : "Not available";
 
+    const contactInfo = isAnonymous
+      ? "Reporter: Anonymous"
+      : `Reporter: ${reporterName || "Not provided"}
+Phone: ${reporterPhone || "Not provided"}
+Instagram: ${reporterInstagram || "Not provided"}
+Contact Note: ${contactNote || "Not provided"}`;
+
+    const medicalInfo = isMedicalHelp
+      ? `Medical Help: Yes
+Conscious: ${consciousStatus || "Not provided"}
+Breathing Normally: ${breathingStatus || "Not provided"}
+Approximate Age: ${approximateAge || "Not provided"}`
+      : "Medical Help: No";
+
     const message = isEmergency
       ? `🚨🚨🚨 EMERGENCY ALERT 🚨🚨🚨
 
@@ -189,6 +219,10 @@ Description: ${description}
 Anonymous: ${isAnonymous ? "Yes" : "No"}
 Time: ${timestamp}
 
+${contactInfo}
+
+${medicalInfo}
+
 📍 Live Map:
 ${gpsLink}`
       : `⚠️ New Safety Report
@@ -198,6 +232,10 @@ Location: ${location || "Not provided"}
 Description: ${description}
 Anonymous: ${isAnonymous ? "Yes" : "No"}
 Time: ${timestamp}
+
+${contactInfo}
+
+${medicalInfo}
 
 📍 Map Location:
 ${gpsLink}`;
@@ -250,10 +288,12 @@ ${gpsLink}`;
             body: notificationBody
           },
           data: {
+            reportId,
             incidentType: incidentType || "",
             location: location || "",
             timestamp: timestamp || "",
-            isEmergency: String(!!isEmergency)
+            isEmergency: String(!!isEmergency),
+            isAnonymous: String(!!isAnonymous)
           },
           apns: {
             payload: {
@@ -269,7 +309,8 @@ ${gpsLink}`;
     }
 
     res.json({
-      success: true
+      success: true,
+      reportId
     });
   } catch (error) {
     console.error("=== BACKEND ERROR ===");
