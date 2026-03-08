@@ -65,6 +65,14 @@ async function generateReportId(incidentType) {
   return prefix + String(newNumber).padStart(3, "0");
 }
 
+function normalizeTimestampFields(data) {
+  return {
+    ...data,
+    createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt,
+    updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate().toISOString() : data.updatedAt
+  };
+}
+
 async function verifyAdminAccess(req) {
   try {
     const uid = req.headers["x-staff-uid"];
@@ -186,15 +194,7 @@ app.get("/reports", async (req, res) => {
 
     const snapshot = await query.get();
 
-    const reports = snapshot.docs.map((doc) => {
-      const data = doc.data();
-
-      return {
-        ...data,
-        createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt,
-        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate().toISOString() : data.updatedAt
-      };
-    });
+    const reports = snapshot.docs.map((doc) => normalizeTimestampFields(doc.data()));
 
     const lastDoc = snapshot.docs.length > 0 ? snapshot.docs[snapshot.docs.length - 1] : null;
     const nextCursor = lastDoc ? lastDoc.id : null;
@@ -211,6 +211,78 @@ app.get("/reports", async (req, res) => {
     res.status(500).json({
       success: false,
       error: "Failed to load reports"
+    });
+  }
+});
+
+app.get("/reports/recent", async (req, res) => {
+  try {
+    const apiKey = req.headers["x-staff-key"];
+
+    if (apiKey !== STAFF_API_KEY) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized"
+      });
+    }
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 10, 25);
+
+    const snapshot = await db
+      .collection("reports")
+      .orderBy("createdAt", "desc")
+      .limit(limit)
+      .get();
+
+    const reports = snapshot.docs.map((doc) => normalizeTimestampFields(doc.data()));
+
+    res.json({
+      success: true,
+      reports
+    });
+  } catch (error) {
+    console.error("GET /reports/recent error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to load recent reports"
+    });
+  }
+});
+
+app.get("/reports/map", async (req, res) => {
+  try {
+    const apiKey = req.headers["x-staff-key"];
+
+    if (apiKey !== STAFF_API_KEY) {
+      return res.status(401).json({
+        success: false,
+        error: "Unauthorized"
+      });
+    }
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 200);
+
+    const snapshot = await db
+      .collection("reports")
+      .where("status", "!=", "resolved")
+      .orderBy("status")
+      .orderBy("createdAt", "desc")
+      .limit(limit)
+      .get();
+
+    const reports = snapshot.docs
+      .map((doc) => normalizeTimestampFields(doc.data()))
+      .filter((report) => report.latitude != null && report.longitude != null);
+
+    res.json({
+      success: true,
+      reports
+    });
+  } catch (error) {
+    console.error("GET /reports/map error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to load map reports"
     });
   }
 });
