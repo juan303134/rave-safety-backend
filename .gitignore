@@ -1,0 +1,5 @@
+.git-icloud-backup-*/
+node_modules/
+.env
+.DS_Store
+
