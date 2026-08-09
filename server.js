@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const FormData = require("form-data");
 const admin = require("firebase-admin");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -13,7 +14,6 @@ app.use(express.json({ limit: "25mb" }));
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const STAFF_API_KEY = process.env.STAFF_API_KEY || "staff123";
 
 const firebaseServiceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
 
@@ -24,8 +24,6 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-
-let staffDevices = [];
 
 function getIncidentPrefix(type) {
   switch (type) {
@@ -188,44 +186,35 @@ app.get("/health", (req, res) => {
     ok: true,
     telegramBot: !!process.env.TELEGRAM_BOT_TOKEN,
     telegramChat: !!process.env.TELEGRAM_CHAT_ID,
-    firebaseJson: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
-    staffApiKey: !!process.env.STAFF_API_KEY
+    firebaseJson: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON
   });
 });
 
-app.post("/staff/register-device", (req, res) => {
+app.post("/staff/register-device", authenticateStaff, async (req, res) => {
   try {
-    const apiKey = req.headers["x-staff-key"];
-
-    if (apiKey !== STAFF_API_KEY) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized"
-      });
-    }
-
     const { fcmToken, platform } = req.body;
+    const normalizedToken = typeof fcmToken === "string" ? fcmToken.trim() : "";
 
-    if (!fcmToken) {
+    if (!normalizedToken) {
       return res.status(400).json({
         success: false,
         error: "Missing token"
       });
     }
 
-    const exists = staffDevices.find((d) => d.fcmToken === fcmToken);
+    const deviceID = crypto.createHash("sha256").update(normalizedToken).digest("hex");
 
-    if (!exists) {
-      staffDevices.push({
-        fcmToken,
-        platform: platform || "ios",
-        registeredAt: new Date().toISOString()
-      });
-    }
+    await db.collection("staffDevices").doc(deviceID).set({
+      fcmToken: normalizedToken,
+      platform: platform === "ios" ? "ios" : "unknown",
+      staffUID: req.staff.uid,
+      active: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
 
     res.json({
       success: true,
-      devicesCount: staffDevices.length
+      deviceID
     });
   } catch (error) {
     console.error("register-device error:", error);
@@ -582,7 +571,28 @@ ${gpsLink}`;
       );
     }
 
-    for (const device of staffDevices) {
+    const staffDevicesSnapshot = await db
+      .collection("staffDevices")
+      .where("active", "==", true)
+      .get();
+
+    for (const deviceDoc of staffDevicesSnapshot.docs) {
+      const device = deviceDoc.data();
+
+      if (!device.fcmToken || !device.staffUID) {
+        continue;
+      }
+
+      const deviceStaffDoc = await db.collection("staffUsers").doc(device.staffUID).get();
+
+      if (!deviceStaffDoc.exists || deviceStaffDoc.data()?.active !== true) {
+        await deviceDoc.ref.set({
+          active: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        continue;
+      }
+
       try {
         await admin.messaging().send({
           token: device.fcmToken,
@@ -608,6 +618,13 @@ ${gpsLink}`;
         });
       } catch (pushError) {
         console.error("Push failed:", pushError.message);
+
+        if ([
+          "messaging/registration-token-not-registered",
+          "messaging/invalid-registration-token"
+        ].includes(pushError.code)) {
+          await deviceDoc.ref.delete();
+        }
       }
     }
 
