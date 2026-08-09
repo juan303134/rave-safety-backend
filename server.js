@@ -6,6 +6,11 @@ const path = require("path");
 const FormData = require("form-data");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
+const {
+  buildStaffPushMessage,
+  getIncidentPrefix,
+  isValidClientReportId
+} = require("./report-utils");
 
 const app = express();
 
@@ -25,42 +30,40 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-function getIncidentPrefix(type) {
-  switch (type) {
-    case "Medical Emergency":
-      return "MED";
-    case "Harassment":
-      return "HAR";
-    case "Violence":
-      return "SEC";
-    case "Theft":
-      return "THE";
-    case "Suspicious Activity":
-      return "SUS";
-    default:
-      return "GEN";
-  }
-}
-
-async function generateReportId(incidentType) {
+async function createReportOnce(clientReportId, incidentType, reportData) {
+  const requestRef = db.collection("reportRequests").doc(clientReportId);
   const prefix = getIncidentPrefix(incidentType);
   const counterRef = db.collection("system").doc(`reportCounter_${prefix}`);
 
-  const newNumber = await db.runTransaction(async (transaction) => {
-    const counterDoc = await transaction.get(counterRef);
+  return db.runTransaction(async (transaction) => {
+    const requestDoc = await transaction.get(requestRef);
 
-    let current = 0;
-    if (counterDoc.exists) {
-      current = counterDoc.data().value || 0;
+    if (requestDoc.exists) {
+      return {
+        reportId: requestDoc.data().reportId,
+        deduplicated: true
+      };
     }
 
+    const counterDoc = await transaction.get(counterRef);
+    const current = counterDoc.exists ? counterDoc.data().value || 0 : 0;
     const next = current + 1;
+    const reportId = prefix + String(next).padStart(3, "0");
+    const reportRef = db.collection("reports").doc(reportId);
 
     transaction.set(counterRef, { value: next }, { merge: true });
-    return next;
-  });
+    transaction.set(reportRef, {
+      ...reportData,
+      id: reportId,
+      clientReportId
+    });
+    transaction.set(requestRef, {
+      reportId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
-  return prefix + String(newNumber).padStart(3, "0");
+    return { reportId, deduplicated: false };
+  });
 }
 
 function normalizeTimestampFields(data) {
@@ -225,6 +228,35 @@ app.post("/staff/register-device", authenticateStaff, async (req, res) => {
   }
 });
 
+app.delete("/staff/register-device", authenticateStaff, async (req, res) => {
+  try {
+    const normalizedToken = typeof req.body.fcmToken === "string" ? req.body.fcmToken.trim() : "";
+
+    if (!normalizedToken) {
+      return res.status(400).json({ success: false, error: "Missing token" });
+    }
+
+    const deviceID = crypto.createHash("sha256").update(normalizedToken).digest("hex");
+    const deviceRef = db.collection("staffDevices").doc(deviceID);
+    const deviceDoc = await deviceRef.get();
+
+    if (deviceDoc.exists && deviceDoc.data().staffUID === req.staff.uid) {
+      await deviceRef.set({
+        active: false,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+    }
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("unregister-device error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to unregister device"
+    });
+  }
+});
+
 app.get(
   "/reports",
   authenticateStaff,
@@ -325,6 +357,27 @@ app.get("/reports/map", authenticateStaff, requireStaffPermission("canViewAllRep
     res.status(500).json({
       success: false,
       error: "Failed to load map reports"
+    });
+  }
+});
+
+app.get("/reports/:id", authenticateStaff, requireStaffPermission("canViewAllReports"), async (req, res) => {
+  try {
+    const reportDoc = await db.collection("reports").doc(req.params.id).get();
+
+    if (!reportDoc.exists) {
+      return res.status(404).json({ success: false, error: "Report not found" });
+    }
+
+    return res.json({
+      success: true,
+      report: normalizeTimestampFields(reportDoc.data())
+    });
+  } catch (error) {
+    console.error("GET /reports/:id error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to load report"
     });
   }
 });
@@ -434,6 +487,7 @@ app.post("/report", async (req, res) => {
 
   try {
     const {
+      clientReportId: providedClientReportId,
       incidentType,
       description,
       location,
@@ -453,15 +507,22 @@ app.post("/report", async (req, res) => {
       contactNote
     } = req.body;
 
-    const reportId = await generateReportId(incidentType);
+    if (providedClientReportId !== undefined && !isValidClientReportId(providedClientReportId)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid client report ID"
+      });
+    }
+
+    const clientReportId = providedClientReportId || crypto.randomUUID();
+    const reportTimestamp = timestamp || new Date().toISOString();
 
     const report = {
-      id: reportId,
       incidentType: incidentType || "Other",
       description: description || "",
       location: location || "",
       isAnonymous: !!isAnonymous,
-      timestamp: timestamp || new Date().toISOString(),
+      timestamp: reportTimestamp,
       latitude: latitude ?? null,
       longitude: longitude ?? null,
       isEmergency: !!isEmergency,
@@ -479,7 +540,21 @@ app.post("/report", async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     };
 
-    await db.collection("reports").doc(reportId).set(report);
+    const { reportId, deduplicated } = await createReportOnce(
+      clientReportId,
+      incidentType,
+      report
+    );
+
+    if (deduplicated) {
+      return res.json({
+        success: true,
+        reportId,
+        deduplicated: true
+      });
+    }
+
+    const deliveryWarnings = [];
 
     const gpsLink =
       latitude != null && longitude != null
@@ -529,108 +604,107 @@ Map:
 ${gpsLink}`;
 
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-      console.error("Missing Telegram env vars");
-      return res.status(500).json({
-        success: false,
-        error: "Telegram environment variables missing"
-      });
-    }
-
-    await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        chat_id: TELEGRAM_CHAT_ID,
-        text: message
-      }
-    );
-
-    if (photoBase64) {
-      const imageBuffer = Buffer.from(photoBase64, "base64");
-      tempFilePath = path.join(__dirname, `photo_${Date.now()}.jpg`);
-
-      fs.writeFileSync(tempFilePath, imageBuffer);
-
-      const form = new FormData();
-      form.append("chat_id", TELEGRAM_CHAT_ID);
-      form.append("photo", fs.createReadStream(tempFilePath));
-      form.append(
-        "caption",
-        isEmergency
-          ? `🚨 Emergency Incident Photo\nReport ID: ${reportId}`
-          : `📸 Incident Photo\nReport ID: ${reportId}`
-      );
-
-      await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`,
-        form,
-        {
-          headers: form.getHeaders(),
-          maxContentLength: Infinity,
-          maxBodyLength: Infinity
-        }
-      );
-    }
-
-    const staffDevicesSnapshot = await db
-      .collection("staffDevices")
-      .where("active", "==", true)
-      .get();
-
-    for (const deviceDoc of staffDevicesSnapshot.docs) {
-      const device = deviceDoc.data();
-
-      if (!device.fcmToken || !device.staffUID) {
-        continue;
-      }
-
-      const deviceStaffDoc = await db.collection("staffUsers").doc(device.staffUID).get();
-
-      if (!deviceStaffDoc.exists || deviceStaffDoc.data()?.active !== true) {
-        await deviceDoc.ref.set({
-          active: false,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        continue;
-      }
-
+      console.error("Telegram delivery skipped: missing environment variables");
+      deliveryWarnings.push("telegram_not_configured");
+    } else {
       try {
-        await admin.messaging().send({
-          token: device.fcmToken,
-          notification: {
-            title: isEmergency ? "🚨 Emergency Alert" : "⚠️ New Report",
-            body: `${incidentType || "Other"} - ${location || "Unknown location"}`
-          },
-          data: {
-            reportId,
-            incidentType: incidentType || "",
-            location: location || "",
-            timestamp: timestamp || "",
-            isEmergency: String(!!isEmergency),
-            isAnonymous: String(!!isAnonymous)
-          },
-          apns: {
-            payload: {
-              aps: {
-                sound: "default"
-              }
-            }
+        await axios.post(
+          `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+          {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: message
           }
-        });
-      } catch (pushError) {
-        console.error("Push failed:", pushError.message);
+        );
 
-        if ([
-          "messaging/registration-token-not-registered",
-          "messaging/invalid-registration-token"
-        ].includes(pushError.code)) {
-          await deviceDoc.ref.delete();
+        if (photoBase64) {
+          const imageBuffer = Buffer.from(photoBase64, "base64");
+          tempFilePath = path.join(__dirname, `photo_${Date.now()}.jpg`);
+
+          fs.writeFileSync(tempFilePath, imageBuffer);
+
+          const form = new FormData();
+          form.append("chat_id", TELEGRAM_CHAT_ID);
+          form.append("photo", fs.createReadStream(tempFilePath));
+          form.append(
+            "caption",
+            isEmergency
+              ? `🚨 Emergency Incident Photo\nReport ID: ${reportId}`
+              : `📸 Incident Photo\nReport ID: ${reportId}`
+          );
+
+          await axios.post(
+            `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`,
+            form,
+            {
+              headers: form.getHeaders(),
+              maxContentLength: Infinity,
+              maxBodyLength: Infinity
+            }
+          );
         }
+      } catch (telegramError) {
+        console.error(
+          "Telegram report delivery error:",
+          telegramError.response?.data || telegramError.message
+        );
+        deliveryWarnings.push("telegram_delivery_failed");
       }
     }
 
-    res.json({
+    try {
+      const staffDevicesSnapshot = await db
+        .collection("staffDevices")
+        .where("active", "==", true)
+        .get();
+
+      for (const deviceDoc of staffDevicesSnapshot.docs) {
+        const device = deviceDoc.data();
+
+        if (!device.fcmToken || !device.staffUID) {
+          continue;
+        }
+
+        const deviceStaffDoc = await db.collection("staffUsers").doc(device.staffUID).get();
+
+        if (!deviceStaffDoc.exists || deviceStaffDoc.data()?.active !== true) {
+          await deviceDoc.ref.set({
+            active: false,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          }, { merge: true });
+          continue;
+        }
+
+        try {
+          await admin.messaging().send(buildStaffPushMessage({
+            token: device.fcmToken,
+            reportId,
+            incidentType,
+            location,
+            timestamp: reportTimestamp,
+            isEmergency,
+            isAnonymous
+          }));
+        } catch (pushError) {
+          console.error("Push failed:", pushError.message);
+
+          if ([
+            "messaging/registration-token-not-registered",
+            "messaging/invalid-registration-token"
+          ].includes(pushError.code)) {
+            await deviceDoc.ref.delete();
+          }
+        }
+      }
+    } catch (pushDeliveryError) {
+      console.error("Push delivery query failed:", pushDeliveryError.message);
+      deliveryWarnings.push("push_delivery_failed");
+    }
+
+    return res.json({
       success: true,
-      reportId
+      reportId,
+      deduplicated: false,
+      deliveryWarnings
     });
   } catch (error) {
     console.error("POST /report error:", error.response?.data || error.message || error);
