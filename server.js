@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const FormData = require("form-data");
 const admin = require("firebase-admin");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -13,7 +14,6 @@ app.use(express.json({ limit: "25mb" }));
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const STAFF_API_KEY = process.env.STAFF_API_KEY || "staff123";
 
 const firebaseServiceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
 
@@ -24,8 +24,6 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-
-let staffDevices = [];
 
 function getIncidentPrefix(type) {
   switch (type) {
@@ -73,6 +71,81 @@ function normalizeTimestampFields(data) {
   };
 }
 
+function getBearerToken(req) {
+  const authorization = req.get("authorization");
+
+  if (!authorization) {
+    return null;
+  }
+
+  const [scheme, token] = authorization.trim().split(/\s+/);
+
+  if (scheme?.toLowerCase() !== "bearer" || !token) {
+    return null;
+  }
+
+  return token;
+}
+
+async function authenticateStaff(req, res, next) {
+  const token = getBearerToken(req);
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      error: "Missing or invalid authorization token"
+    });
+  }
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(token, true);
+    const staffDoc = await db.collection("staffUsers").doc(decodedToken.uid).get();
+
+    if (!staffDoc.exists) {
+      return res.status(403).json({
+        success: false,
+        error: "Staff profile not found"
+      });
+    }
+
+    const profile = staffDoc.data() || {};
+
+    if (!profile.active) {
+      return res.status(403).json({
+        success: false,
+        error: "Staff account inactive"
+      });
+    }
+
+    req.staff = {
+      uid: decodedToken.uid,
+      profile
+    };
+
+    return next();
+  } catch (error) {
+    console.error("authenticateStaff error:", error.code || error.message || error);
+
+    return res.status(401).json({
+      success: false,
+      error: "Invalid or expired authorization token"
+    });
+  }
+}
+
+function requireStaffPermission(permission) {
+  return (req, res, next) => {
+    if (req.staff?.profile?.[permission] !== true) {
+      return res.status(403).json({
+        success: false,
+        error: `Missing required permission: ${permission}`
+      });
+    }
+
+    return next();
+  };
+}
+
 async function verifyAdminAccess(req) {
   try {
     const uid = req.headers["x-staff-uid"];
@@ -113,44 +186,35 @@ app.get("/health", (req, res) => {
     ok: true,
     telegramBot: !!process.env.TELEGRAM_BOT_TOKEN,
     telegramChat: !!process.env.TELEGRAM_CHAT_ID,
-    firebaseJson: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
-    staffApiKey: !!process.env.STAFF_API_KEY
+    firebaseJson: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON
   });
 });
 
-app.post("/staff/register-device", (req, res) => {
+app.post("/staff/register-device", authenticateStaff, async (req, res) => {
   try {
-    const apiKey = req.headers["x-staff-key"];
-
-    if (apiKey !== STAFF_API_KEY) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized"
-      });
-    }
-
     const { fcmToken, platform } = req.body;
+    const normalizedToken = typeof fcmToken === "string" ? fcmToken.trim() : "";
 
-    if (!fcmToken) {
+    if (!normalizedToken) {
       return res.status(400).json({
         success: false,
         error: "Missing token"
       });
     }
 
-    const exists = staffDevices.find((d) => d.fcmToken === fcmToken);
+    const deviceID = crypto.createHash("sha256").update(normalizedToken).digest("hex");
 
-    if (!exists) {
-      staffDevices.push({
-        fcmToken,
-        platform: platform || "ios",
-        registeredAt: new Date().toISOString()
-      });
-    }
+    await db.collection("staffDevices").doc(deviceID).set({
+      fcmToken: normalizedToken,
+      platform: platform === "ios" ? "ios" : "unknown",
+      staffUID: req.staff.uid,
+      active: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
 
     res.json({
       success: true,
-      devicesCount: staffDevices.length
+      deviceID
     });
   } catch (error) {
     console.error("register-device error:", error);
@@ -161,71 +225,58 @@ app.post("/staff/register-device", (req, res) => {
   }
 });
 
-app.get("/reports", async (req, res) => {
-  try {
-    const apiKey = req.headers["x-staff-key"];
+app.get(
+  "/reports",
+  authenticateStaff,
+  requireStaffPermission("canViewAllReports"),
+  async (req, res) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
+      const cursor = req.query.cursor;
 
-    if (apiKey !== STAFF_API_KEY) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized"
-      });
-    }
+      let query = db
+        .collection("reports")
+        .orderBy("createdAt", "desc")
+        .limit(limit);
 
-    const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
-    const cursor = req.query.cursor;
+      if (cursor) {
+        const cursorDoc = await db.collection("reports").doc(cursor).get();
 
-    let query = db
-      .collection("reports")
-      .orderBy("createdAt", "desc")
-      .limit(limit);
-
-    if (cursor) {
-      const cursorDoc = await db.collection("reports").doc(cursor).get();
-
-      if (cursorDoc.exists) {
-        query = db
-          .collection("reports")
-          .orderBy("createdAt", "desc")
-          .startAfter(cursorDoc)
-          .limit(limit);
+        if (cursorDoc.exists) {
+          query = db
+            .collection("reports")
+            .orderBy("createdAt", "desc")
+            .startAfter(cursorDoc)
+            .limit(limit);
+        }
       }
-    }
 
-    const snapshot = await query.get();
+      const snapshot = await query.get();
 
-    const reports = snapshot.docs.map((doc) => normalizeTimestampFields(doc.data()));
+      const reports = snapshot.docs.map((doc) => normalizeTimestampFields(doc.data()));
 
-    const lastDoc = snapshot.docs.length > 0 ? snapshot.docs[snapshot.docs.length - 1] : null;
-    const nextCursor = lastDoc ? lastDoc.id : null;
-    const hasMore = snapshot.docs.length === limit;
+      const lastDoc = snapshot.docs.length > 0 ? snapshot.docs[snapshot.docs.length - 1] : null;
+      const nextCursor = lastDoc ? lastDoc.id : null;
+      const hasMore = snapshot.docs.length === limit;
 
-    res.json({
-      success: true,
-      reports,
-      nextCursor,
-      hasMore
-    });
-  } catch (error) {
-    console.error("get reports error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to load reports"
-    });
-  }
-});
-
-app.get("/reports/recent", async (req, res) => {
-  try {
-    const apiKey = req.headers["x-staff-key"];
-
-    if (apiKey !== STAFF_API_KEY) {
-      return res.status(401).json({
+      res.json({
+        success: true,
+        reports,
+        nextCursor,
+        hasMore
+      });
+    } catch (error) {
+      console.error("get reports error:", error);
+      res.status(500).json({
         success: false,
-        error: "Unauthorized"
+        error: "Failed to load reports"
       });
     }
+  }
+);
 
+app.get("/reports/recent", authenticateStaff, requireStaffPermission("canViewAllReports"), async (req, res) => {
+  try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 10, 25);
 
     const snapshot = await db
@@ -249,17 +300,8 @@ app.get("/reports/recent", async (req, res) => {
   }
 });
 
-app.get("/reports/map", async (req, res) => {
+app.get("/reports/map", authenticateStaff, requireStaffPermission("canViewAllReports"), async (req, res) => {
   try {
-    const apiKey = req.headers["x-staff-key"];
-
-    if (apiKey !== STAFF_API_KEY) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized"
-      });
-    }
-
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 200);
 
     const snapshot = await db
@@ -322,17 +364,8 @@ app.get("/report-status/:id", async (req, res) => {
   }
 });
 
-app.patch("/reports/:id/status", async (req, res) => {
+app.patch("/reports/:id/status", authenticateStaff, requireStaffPermission("canViewAllReports"), async (req, res) => {
   try {
-    const apiKey = req.headers["x-staff-key"];
-
-    if (apiKey !== STAFF_API_KEY) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized"
-      });
-    }
-
     const { id } = req.params;
     const { status } = req.body;
 
@@ -538,7 +571,28 @@ ${gpsLink}`;
       );
     }
 
-    for (const device of staffDevices) {
+    const staffDevicesSnapshot = await db
+      .collection("staffDevices")
+      .where("active", "==", true)
+      .get();
+
+    for (const deviceDoc of staffDevicesSnapshot.docs) {
+      const device = deviceDoc.data();
+
+      if (!device.fcmToken || !device.staffUID) {
+        continue;
+      }
+
+      const deviceStaffDoc = await db.collection("staffUsers").doc(device.staffUID).get();
+
+      if (!deviceStaffDoc.exists || deviceStaffDoc.data()?.active !== true) {
+        await deviceDoc.ref.set({
+          active: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        continue;
+      }
+
       try {
         await admin.messaging().send({
           token: device.fcmToken,
@@ -564,6 +618,13 @@ ${gpsLink}`;
         });
       } catch (pushError) {
         console.error("Push failed:", pushError.message);
+
+        if ([
+          "messaging/registration-token-not-registered",
+          "messaging/invalid-registration-token"
+        ].includes(pushError.code)) {
+          await deviceDoc.ref.delete();
+        }
       }
     }
 
