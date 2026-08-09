@@ -320,17 +320,8 @@ app.get("/reports/recent", async (req, res) => {
   }
 });
 
-app.get("/reports/map", async (req, res) => {
+app.get("/reports/map", authenticateStaff, requireStaffPermission("canViewAllReports"), async (req, res) => {
   try {
-    const apiKey = req.headers["x-staff-key"];
-
-    if (apiKey !== STAFF_API_KEY) {
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized"
-      });
-    }
-
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 200);
 
     const snapshot = await db
