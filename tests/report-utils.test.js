@@ -4,7 +4,10 @@ const assert = require("node:assert/strict");
 const {
   buildStaffPushMessage,
   getIncidentPrefix,
-  isValidClientReportId
+  hasStaffPermission,
+  hasStaffRole,
+  isValidClientReportId,
+  matchesStaffRole
 } = require("../report-utils");
 
 test("maps incident types to stable report prefixes", () => {
@@ -40,4 +43,18 @@ test("builds a tappable iOS push payload with a badge", () => {
   assert.equal(message.notification.title, "🚨 Emergency Alert");
   assert.equal(message.apns.payload.aps.sound, "default");
   assert.equal(message.apns.payload.aps.badge, 1);
+});
+
+test("requires an active profile and an explicit staff permission", () => {
+  assert.equal(hasStaffPermission({ active: true, canManageStaff: true }, "canManageStaff"), true);
+  assert.equal(hasStaffPermission({ active: false, canManageStaff: true }, "canManageStaff"), false);
+  assert.equal(hasStaffPermission({ active: true, canManageStaff: false }, "canManageStaff"), false);
+  assert.equal(hasStaffPermission({}, "canManageStaff"), false);
+});
+
+test("matches active staff roles without trusting client-provided IDs", () => {
+  assert.equal(hasStaffRole({ active: true, role: "Admin" }, "admin"), true);
+  assert.equal(hasStaffRole({ active: true, role: "operations" }, "admin"), false);
+  assert.equal(hasStaffRole({ active: false, role: "admin" }, "admin"), false);
+  assert.equal(matchesStaffRole({ active: false, role: " Admin " }, "admin"), true);
 });

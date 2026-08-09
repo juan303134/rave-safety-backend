@@ -9,7 +9,10 @@ const crypto = require("crypto");
 const {
   buildStaffPushMessage,
   getIncidentPrefix,
-  isValidClientReportId
+  hasStaffPermission,
+  hasStaffRole,
+  isValidClientReportId,
+  matchesStaffRole
 } = require("./report-utils");
 
 const app = express();
@@ -138,7 +141,7 @@ async function authenticateStaff(req, res, next) {
 
 function requireStaffPermission(permission) {
   return (req, res, next) => {
-    if (req.staff?.profile?.[permission] !== true) {
+    if (!hasStaffPermission(req.staff?.profile, permission)) {
       return res.status(403).json({
         success: false,
         error: `Missing required permission: ${permission}`
@@ -149,35 +152,17 @@ function requireStaffPermission(permission) {
   };
 }
 
-async function verifyAdminAccess(req) {
-  try {
-    const uid = req.headers["x-staff-uid"];
-
-    if (!uid) {
-      return { ok: false, status: 401, error: "Missing staff uid" };
+function requireStaffRole(role) {
+  return (req, res, next) => {
+    if (!hasStaffRole(req.staff?.profile, role)) {
+      return res.status(403).json({
+        success: false,
+        error: `Required staff role: ${role}`
+      });
     }
 
-    const staffDoc = await db.collection("staffUsers").doc(uid).get();
-
-    if (!staffDoc.exists) {
-      return { ok: false, status: 403, error: "Staff profile not found" };
-    }
-
-    const data = staffDoc.data() || {};
-
-    if (!data.active) {
-      return { ok: false, status: 403, error: "Staff account inactive" };
-    }
-
-    if (!data.canManageStaff) {
-      return { ok: false, status: 403, error: "No permission to manage staff" };
-    }
-
-    return { ok: true, uid, profile: data };
-  } catch (error) {
-    console.error("verifyAdminAccess error:", error);
-    return { ok: false, status: 500, error: "Failed to verify admin access" };
-  }
+    return next();
+  };
 }
 
 app.get("/", (req, res) => {
@@ -720,17 +705,8 @@ ${gpsLink}`;
   }
 });
 
-app.delete("/admin/reports/:id", async (req, res) => {
+app.delete("/admin/reports/:id", authenticateStaff, requireStaffRole("admin"), async (req, res) => {
   try {
-    const access = await verifyAdminAccess(req);
-
-    if (!access.ok) {
-      return res.status(access.status).json({
-        success: false,
-        error: access.error
-      });
-    }
-
     const { id } = req.params;
 
     const reportRef = db.collection("reports").doc(id);
@@ -743,7 +719,16 @@ app.delete("/admin/reports/:id", async (req, res) => {
       });
     }
 
-    await reportRef.delete();
+    const batch = db.batch();
+    const clientReportId = reportDoc.data().clientReportId;
+
+    batch.delete(reportRef);
+
+    if (isValidClientReportId(clientReportId)) {
+      batch.delete(db.collection("reportRequests").doc(clientReportId));
+    }
+
+    await batch.commit();
 
     res.json({
       success: true,
@@ -758,21 +743,16 @@ app.delete("/admin/reports/:id", async (req, res) => {
   }
 });
 
-app.delete("/admin/reports", async (req, res) => {
+app.delete("/admin/reports", authenticateStaff, requireStaffRole("admin"), async (req, res) => {
   try {
-    const access = await verifyAdminAccess(req);
+    const [reportsSnapshot, requestsSnapshot] = await Promise.all([
+      db.collection("reports").get(),
+      db.collection("reportRequests").get()
+    ]);
+    const docs = [...reportsSnapshot.docs, ...requestsSnapshot.docs];
 
-    if (!access.ok) {
-      return res.status(access.status).json({
-        success: false,
-        error: access.error
-      });
-    }
-
-    const snapshot = await db.collection("reports").get();
-    const docs = snapshot.docs;
-
-    let deletedCount = 0;
+    const deletedCount = reportsSnapshot.size;
+    const deletedRequestCount = requestsSnapshot.size;
     const batchSize = 400;
 
     for (let i = 0; i < docs.length; i += batchSize) {
@@ -781,7 +761,6 @@ app.delete("/admin/reports", async (req, res) => {
 
       chunk.forEach((doc) => {
         batch.delete(doc.ref);
-        deletedCount += 1;
       });
 
       await batch.commit();
@@ -790,7 +769,8 @@ app.delete("/admin/reports", async (req, res) => {
     res.json({
       success: true,
       message: "All reports deleted",
-      deletedCount
+      deletedCount,
+      deletedRequestCount
     });
   } catch (error) {
     console.error("DELETE /admin/reports error:", error);
@@ -801,17 +781,8 @@ app.delete("/admin/reports", async (req, res) => {
   }
 });
 
-app.get("/admin/staff-users", async (req, res) => {
+app.get("/admin/staff-users", authenticateStaff, requireStaffPermission("canManageStaff"), async (req, res) => {
   try {
-    const access = await verifyAdminAccess(req);
-
-    if (!access.ok) {
-      return res.status(access.status).json({
-        success: false,
-        error: access.error
-      });
-    }
-
     const snapshot = await db.collection("staffUsers").get();
 
     const staffUsers = snapshot.docs.map((doc) => {
@@ -844,17 +815,8 @@ app.get("/admin/staff-users", async (req, res) => {
   }
 });
 
-app.post("/admin/create-staff", async (req, res) => {
+app.post("/admin/create-staff", authenticateStaff, requireStaffPermission("canManageStaff"), async (req, res) => {
   try {
-    const access = await verifyAdminAccess(req);
-
-    if (!access.ok) {
-      return res.status(access.status).json({
-        success: false,
-        error: access.error
-      });
-    }
-
     const {
       name,
       email,
@@ -867,6 +829,17 @@ app.post("/admin/create-staff", async (req, res) => {
       canUseStaffChat,
       canViewAllReports
     } = req.body;
+
+    if (active !== undefined && typeof active !== "boolean") {
+      return res.status(400).json({ success: false, error: "Active must be a boolean" });
+    }
+
+    if (matchesStaffRole({ role }, "admin") && !hasStaffRole(req.staff.profile, "admin")) {
+      return res.status(403).json({
+        success: false,
+        error: "Only an admin can create another admin"
+      });
+    }
 
     if (!name || !email || !password || !role || !team) {
       return res.status(400).json({
@@ -898,6 +871,7 @@ app.post("/admin/create-staff", async (req, res) => {
       canEditEventInfo: canEditEventInfo ?? false,
       canUseStaffChat: canUseStaffChat ?? true,
       canViewAllReports: canViewAllReports ?? true,
+      createdBy: req.staff.uid,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
@@ -936,17 +910,8 @@ app.post("/admin/create-staff", async (req, res) => {
   }
 });
 
-app.patch("/admin/update-staff/:uid", async (req, res) => {
+app.patch("/admin/update-staff/:uid", authenticateStaff, requireStaffPermission("canManageStaff"), async (req, res) => {
   try {
-    const access = await verifyAdminAccess(req);
-
-    if (!access.ok) {
-      return res.status(access.status).json({
-        success: false,
-        error: access.error
-      });
-    }
-
     const { uid } = req.params;
 
     const {
@@ -960,6 +925,42 @@ app.patch("/admin/update-staff/:uid", async (req, res) => {
       canViewAllReports
     } = req.body;
 
+    if (active !== undefined && typeof active !== "boolean") {
+      return res.status(400).json({ success: false, error: "Active must be a boolean" });
+    }
+
+    if (uid === req.staff.uid && active === false) {
+      return res.status(400).json({
+        success: false,
+        error: "You cannot deactivate your own staff account"
+      });
+    }
+
+    if (uid === req.staff.uid && canManageStaff === false) {
+      return res.status(400).json({
+        success: false,
+        error: "You cannot remove your own staff management permission"
+      });
+    }
+
+    const staffRef = db.collection("staffUsers").doc(uid);
+    const staffDoc = await staffRef.get();
+
+    if (!staffDoc.exists) {
+      return res.status(404).json({ success: false, error: "Staff profile not found" });
+    }
+
+    const actorIsAdmin = hasStaffRole(req.staff.profile, "admin");
+    const targetIsAdmin = matchesStaffRole(staffDoc.data(), "admin");
+    const grantsAdminRole = role !== undefined && matchesStaffRole({ role }, "admin");
+
+    if (!actorIsAdmin && (targetIsAdmin || grantsAdminRole)) {
+      return res.status(403).json({
+        success: false,
+        error: "Only an admin can modify admin accounts or grant the admin role"
+      });
+    }
+
     const updates = {};
 
     if (name !== undefined) updates.name = name;
@@ -971,9 +972,10 @@ app.patch("/admin/update-staff/:uid", async (req, res) => {
     if (canUseStaffChat !== undefined) updates.canUseStaffChat = canUseStaffChat;
     if (canViewAllReports !== undefined) updates.canViewAllReports = canViewAllReports;
 
+    updates.updatedBy = req.staff.uid;
     updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
 
-    await db.collection("staffUsers").doc(uid).update(updates);
+    await staffRef.update(updates);
 
     if (name !== undefined) {
       await admin.auth().updateUser(uid, {
@@ -993,22 +995,42 @@ app.patch("/admin/update-staff/:uid", async (req, res) => {
   }
 });
 
-app.patch("/admin/toggle-staff/:uid", async (req, res) => {
+app.patch("/admin/toggle-staff/:uid", authenticateStaff, requireStaffPermission("canManageStaff"), async (req, res) => {
   try {
-    const access = await verifyAdminAccess(req);
-
-    if (!access.ok) {
-      return res.status(access.status).json({
-        success: false,
-        error: access.error
-      });
-    }
-
     const { uid } = req.params;
     const { active } = req.body;
 
-    await db.collection("staffUsers").doc(uid).update({
+    if (typeof active !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        error: "Active must be a boolean"
+      });
+    }
+
+    if (uid === req.staff.uid && active === false) {
+      return res.status(400).json({
+        success: false,
+        error: "You cannot deactivate your own staff account"
+      });
+    }
+
+    const staffRef = db.collection("staffUsers").doc(uid);
+    const staffDoc = await staffRef.get();
+
+    if (!staffDoc.exists) {
+      return res.status(404).json({ success: false, error: "Staff profile not found" });
+    }
+
+    if (matchesStaffRole(staffDoc.data(), "admin") && !hasStaffRole(req.staff.profile, "admin")) {
+      return res.status(403).json({
+        success: false,
+        error: "Only an admin can activate or deactivate another admin"
+      });
+    }
+
+    await staffRef.update({
       active,
+      updatedBy: req.staff.uid,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 

@@ -19,6 +19,19 @@ function isValidClientReportId(value) {
   return typeof value === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(value);
 }
 
+function hasStaffPermission(profile, permission) {
+  return profile?.active === true && profile?.[permission] === true;
+}
+
+function matchesStaffRole(profile, role) {
+  return typeof profile?.role === "string" &&
+    profile.role.trim().toLowerCase() === role.trim().toLowerCase();
+}
+
+function hasStaffRole(profile, role) {
+  return profile?.active === true && matchesStaffRole(profile, role);
+}
+
 function buildStaffPushMessage({
   token,
   reportId,
@@ -56,5 +69,8 @@ function buildStaffPushMessage({
 module.exports = {
   buildStaffPushMessage,
   getIncidentPrefix,
-  isValidClientReportId
+  hasStaffPermission,
+  hasStaffRole,
+  isValidClientReportId,
+  matchesStaffRole
 };
